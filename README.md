@@ -19,13 +19,13 @@ Named after Argus Panoptes, the hundred eyed giant of Greek myth who never truly
 
 ## Status
 
-Early build. See [docs/prd.md](docs/prd.md) for the full product requirements and [WORKFLOW.md](WORKFLOW.md) for the current milestone.
+Early build (MVP P2). See [docs/prd.md](docs/prd.md) for the full product requirements and [WORKFLOW.md](WORKFLOW.md) for the current milestone.
 
 ## Repository layout
 
 ```
-apps/desktop             Tauri + React desktop app
-apps/pwa                 React PWA, the phone facing remote control
+apps/desktop             Tauri + React desktop app (not yet wired)
+apps/pwa                 React PWA, the phone facing remote control (not yet wired)
 services/agent-manager   Go local service, process management and agent adapters
 supabase                 Database schema and control plane config
 docs                     Product, marketing and monetization documents
@@ -35,25 +35,42 @@ docs                     Product, marketing and monetization documents
 
 Tauri 2, Go, React with TypeScript, Vite and Tailwind, Supabase (Postgres, Auth, Realtime), SQLite locally.
 
-## Getting started
-
-This is a scaffold. Each package will get its own detailed setup notes as it fills in. Starting points:
+## Getting started (agent-manager only — the only runnable component right now)
 
 ```bash
-# Go service
+# Build the Go service
 cd services/agent-manager
-go build ./...
+go build -o agent-manager ./cmd/agent-manager
 
-# Desktop app
-cd apps/desktop
-npm install
-npm run dev
+# Run the service (dashboard on http://localhost:8080)
+./agent-manager --port=8080
 
-# PWA
-cd apps/pwa
-npm install
-npm run dev
+# Optional: enable Meta diagnosis (requires API key)
+# ./agent-manager --port=8080 --meta-api-key=YOUR_KEY --meta-base-url=https://api.meta.example.com/v1
 ```
+
+Open **http://localhost:8080/** in a browser to see the dashboard UI.
+
+### API endpoints (for scripting)
+
+- `GET /health` – health check
+- `GET /api/dashboard` – full session/task/incident/approval snapshot
+- `POST /api/sessions` – start a new OpenCode session  
+  body: `{ "project_dir": "/path/to/project", "prompt": "your prompt", "model": "optional" }`
+- `GET /api/events?session_id=...` – recent events for a session
+- `POST /api/incidents?session_id=...` – body `{ "action": "detect" }` runs incident detection
+- `POST /api/diagnosis` – body `{ "incident_id": "..." }` requests Meta/fallback diagnosis
+- `POST /api/recovery/approval` – body `{ "recovery_id": "..." }` creates approval for a recovery action
+- `POST /api/approvals/{id}` – body `{ "approved": true, "decided_by": "user" }` approves/rejects
+
+### Limitations (MVP)
+
+- Only the Go agent-manager runs; desktop (Tauri) and PWA are scaffolds.
+- OpenCode integration uses the CLI (`opencode run --format=json`), not the unstable HTTP server.
+- No push notifications yet (web‑push / ntfy fallback not implemented).
+- Meta diagnosis uses a deterministic fallback unless `--meta-api-key` is supplied.
+- Approval workflow is manual via the dashboard; no mobile UI yet.
+- No quota display, no model switching, no git awareness, no resource guardian.
 
 ## Guides for AI assistants working in this repo
 
