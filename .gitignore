@@ -151,8 +151,6 @@ vite.config.ts.timestamp-*
 # Go build artifacts
 services/agent-manager/agent-manager
 services/agent-manager/argus.db*
-services/agent-manager/internal/notification/
-services/agent-manager/internal/supabase/
 
 # Tauri / Rust build artifacts
 apps/desktop/src-tauri/target/
