@@ -147,3 +147,24 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Go build artifacts
+services/agent-manager/agent-manager
+services/agent-manager/argus.db*
+services/agent-manager/internal/notification/
+services/agent-manager/internal/supabase/
+
+# Tauri / Rust build artifacts
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/Cargo.lock
+apps/desktop/src-tauri/argus.db*
+apps/desktop/src-tauri/icons/
+apps/desktop/src-tauri/gen/
+apps/desktop/dist/
+
+# PWA build output
+apps/pwa/dist/
+apps/pwa/public/
+
+# Local environment files (already ignored .env, .env.* but keep .env.example)
+!.env.example
