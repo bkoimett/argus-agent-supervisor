@@ -25,9 +25,9 @@ func TestRecoveryWorkflow(t *testing.T) {
 	defer st.Close()
 
 	procConfig := subprocess.OpenCodeConfig{BinaryPath: "opencode"}
-	procMgr := subprocess.NewProcessManager(st, procConfig)
+	procMgr := subprocess.NewProcessManager(st, nil, nil, procConfig)
 	metaConfig := meta.DefaultConfig() // Uses fallback
-	mgr := NewManager(st, procMgr, metaConfig)
+	mgr := NewManager(st, procMgr, metaConfig, nil, nil)
 
 	projDir := "/tmp/test-recovery-" + time.Now().Format("20060102150405.000000000")
 	defer os.RemoveAll(projDir)

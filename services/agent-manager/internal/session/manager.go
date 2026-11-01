@@ -13,21 +13,25 @@ import (
 	"time"
 
 	"github.com/argus-command-center/argus/services/agent-manager/internal/meta"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/notification"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/state"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/store"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/subprocess"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/supabase"
 	"github.com/google/uuid"
 )
 
 // Manager coordinates sessions, tasks, incidents, approvals, and recovery.
 type Manager struct {
-	store      *store.Store
-	procMgr    *subprocess.ProcessManager
-	metaClient *meta.Client
-	mu         sync.RWMutex
-	eventSubs  map[string][]chan *state.Event
-	taskQueue  chan *TaskExecution
-	approvalCh chan *ApprovalRequest
+	store       *store.Store
+	procMgr     *subprocess.ProcessManager
+	metaClient  *meta.Client
+	supabase    *supabase.Client
+	notifClient *notification.Client
+	mu          sync.RWMutex
+	eventSubs   map[string][]chan *state.Event
+	taskQueue   chan *TaskExecution
+	approvalCh  chan *ApprovalRequest
 }
 
 // TaskExecution represents a task to be executed.
@@ -44,14 +48,16 @@ type ApprovalRequest struct {
 }
 
 // NewManager creates a new session manager.
-func NewManager(st *store.Store, procMgr *subprocess.ProcessManager, metaConfig meta.Config) *Manager {
+func NewManager(st *store.Store, procMgr *subprocess.ProcessManager, metaConfig meta.Config, sbClient *supabase.Client, notifClient *notification.Client) *Manager {
 	m := &Manager{
-		store:      st,
-		procMgr:    procMgr,
-		metaClient: meta.NewClient(metaConfig),
-		eventSubs:  make(map[string][]chan *state.Event),
-		taskQueue:  make(chan *TaskExecution, 100),
-		approvalCh: make(chan *ApprovalRequest, 100),
+		store:       st,
+		procMgr:     procMgr,
+		metaClient:  meta.NewClient(metaConfig),
+		supabase:    sbClient,
+		notifClient: notifClient,
+		eventSubs:   make(map[string][]chan *state.Event),
+		taskQueue:   make(chan *TaskExecution, 100),
+		approvalCh:  make(chan *ApprovalRequest, 100),
 	}
 
 	go m.taskWorker()
@@ -106,21 +112,28 @@ func (m *Manager) CreateSession(ctx context.Context, projectDir, model, prompt s
 		return nil, nil, fmt.Errorf("create task: %w", err)
 	}
 
+	// Sync to Supabase
+	m.syncSession(session)
+	m.syncTask(task)
+
 	// Start the OpenCode process
 	mp, err := m.procMgr.StartSession(ctx, sessionID, absProjectDir, prompt)
 	if err != nil {
 		session.Status = state.SessionStatusError
 		session.ErrorMessage = err.Error()
 		m.store.UpdateSession(session)
+		m.syncSession(session)
 		return nil, nil, fmt.Errorf("start opencode: %w", err)
 	}
 
 	session.Status = state.SessionStatusRunning
 	session.PID = mp.PID
 	m.store.UpdateSession(session)
+	m.syncSession(session)
 
 	task.Status = state.TaskStatusRunning
 	m.store.UpdateTask(task)
+	m.syncTask(task)
 
 	return session, task, nil
 }
@@ -216,8 +229,12 @@ func (m *Manager) RequestApproval(approval *state.Approval) error {
 			task.Status = state.TaskStatusParked
 			task.ApprovalID = &approval.ID
 			m.store.UpdateTask(task)
+			m.syncTask(task)
 		}
 	}
+
+	// Send notification for permission request
+	m.sendApprovalNotification(approval)
 
 	// Notify approval worker
 	resp := make(chan error, 1)
@@ -285,6 +302,7 @@ func (m *Manager) RespondApproval(approvalID string, approved bool, decidedBy st
 		if err := m.store.UpdateApproval(approval); err != nil {
 			return err
 		}
+		m.syncApproval(approval)
 
 		// Update incident status
 		if approval.IncidentID != nil {
@@ -297,6 +315,7 @@ func (m *Manager) RespondApproval(approvalID string, approved bool, decidedBy st
 					inc.Status = state.IncidentStatusRejected
 				}
 				m.store.UpdateIncident(inc)
+				m.syncIncident(inc)
 			}
 		}
 	}
@@ -312,6 +331,7 @@ func (m *Manager) RespondApproval(approvalID string, approved bool, decidedBy st
 			}
 			task.ApprovalID = nil
 			m.store.UpdateTask(task)
+			m.syncTask(task)
 		}
 	}
 
@@ -325,7 +345,11 @@ func (m *Manager) GetPendingApprovals() ([]*state.Approval, error) {
 
 // CreateIncident records a new incident.
 func (m *Manager) CreateIncident(inc *state.Incident) error {
-	return m.store.CreateIncident(inc)
+	err := m.store.CreateIncident(inc)
+	if err == nil {
+		m.syncIncident(inc)
+	}
+	return err
 }
 
 // DiagnoseIncident uses Meta to diagnose an incident and propose recovery.
@@ -342,6 +366,7 @@ func (m *Manager) DiagnoseIncident(incidentID string) error {
 	if err := m.store.UpdateIncident(inc); err != nil {
 		return err
 	}
+	m.syncIncident(inc)
 
 	// Prepare diagnosis request
 	req := meta.DiagnosisRequest{
@@ -363,6 +388,7 @@ func (m *Manager) DiagnoseIncident(incidentID string) error {
 		inc.Status = state.IncidentStatusFailed
 		inc.MetaDiagnosis = fmt.Sprintf("diagnosis error: %v", err)
 		m.store.UpdateIncident(inc)
+		m.syncIncident(inc)
 		return fmt.Errorf("diagnosis failed: %w", err)
 	}
 
@@ -376,6 +402,7 @@ func (m *Manager) DiagnoseIncident(incidentID string) error {
 	if err := m.store.UpdateIncident(inc); err != nil {
 		return err
 	}
+	m.syncIncident(inc)
 
 	// Create recovery action from plan
 	action := &state.RecoveryAction{
@@ -406,11 +433,16 @@ func (m *Manager) ProposeRecovery(incidentID string, action *state.RecoveryActio
 	if err := m.store.UpdateIncident(inc); err != nil {
 		return err
 	}
+	m.syncIncident(inc)
 
 	action.IncidentID = incidentID
 	action.Status = state.IncidentStatusProposed
 	action.ProposedAt = now
-	return m.store.CreateRecoveryAction(action)
+	err = m.store.CreateRecoveryAction(action)
+	if err == nil {
+		m.syncRecoveryAction(action)
+	}
+	return err
 }
 
 // ListRecoveryActions returns all recovery actions, optionally filtered by incident.
@@ -484,6 +516,7 @@ func (m *Manager) ExecuteRecovery(recoveryID string) (*state.VerificationResult,
 	if err := m.store.UpdateRecoveryAction(ra); err != nil {
 		return nil, err
 	}
+	m.syncRecoveryAction(ra)
 
 	// Update incident status
 	inc, err := m.store.GetIncident(ra.IncidentID)
@@ -492,6 +525,7 @@ func (m *Manager) ExecuteRecovery(recoveryID string) (*state.VerificationResult,
 	}
 	inc.Status = state.IncidentStatusRecovering
 	m.store.UpdateIncident(inc)
+	m.syncIncident(inc)
 
 	// Run the verification command (allowlisted) in the project directory
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -574,6 +608,7 @@ func (m *Manager) ExecuteRecovery(recoveryID string) (*state.VerificationResult,
 	if err := m.store.UpdateRecoveryAction(ra); err != nil {
 		return nil, err
 	}
+	m.syncRecoveryAction(ra)
 
 	// Update incident based on verification result
 	inc, err = m.store.GetIncident(ra.IncidentID)
@@ -599,6 +634,7 @@ func (m *Manager) ExecuteRecovery(recoveryID string) (*state.VerificationResult,
 	if err := m.store.UpdateIncident(inc); err != nil {
 		return nil, err
 	}
+	m.syncIncident(inc)
 
 	return result, nil
 }
@@ -686,6 +722,7 @@ func (m *Manager) taskWorker() {
 		// For now, just mark as running
 		exec.Task.Status = state.TaskStatusRunning
 		m.store.UpdateTask(exec.Task)
+		m.syncTask(exec.Task)
 		exec.Response <- nil
 	}
 }
@@ -750,6 +787,8 @@ func (m *Manager) DetectIncidentsFromEvents(sessionID string) ([]*state.Incident
 				if err := m.store.CreateIncident(incident); err != nil {
 					continue // Skip duplicate
 				}
+				// Send notification for new incident
+				m.sendIncidentNotification(incident, notification.NotificationTypeError)
 				incidents = append(incidents, incident)
 			}
 		}
@@ -1097,6 +1136,121 @@ func payloadGetString(payload map[string]interface{}, key string) string {
 }
 
 // ContinueParkedTask resumes a task after approval.
+// syncSession syncs session to Supabase.
+func (m *Manager) syncSession(sess *state.Session) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncSession(ctx, sess); err != nil {
+		// Log but don't fail
+		fmt.Printf("Supabase sync session error: %v\n", err)
+	}
+}
+
+// syncTask syncs task to Supabase.
+func (m *Manager) syncTask(task *state.Task) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncTask(ctx, task); err != nil {
+		fmt.Printf("Supabase sync task error: %v\n", err)
+	}
+}
+
+// syncIncident syncs incident to Supabase.
+func (m *Manager) syncIncident(inc *state.Incident) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncIncident(ctx, inc); err != nil {
+		fmt.Printf("Supabase sync incident error: %v\n", err)
+	}
+}
+
+// syncApproval syncs approval to Supabase.
+func (m *Manager) syncApproval(appr *state.Approval) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncApproval(ctx, appr); err != nil {
+		fmt.Printf("Supabase sync approval error: %v\n", err)
+	}
+}
+
+// syncRecoveryAction syncs recovery action to Supabase.
+func (m *Manager) syncRecoveryAction(ra *state.RecoveryAction) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncRecoveryAction(ctx, ra); err != nil {
+		fmt.Printf("Supabase sync recovery action error: %v\n", err)
+	}
+}
+
+// syncEvent syncs event to Supabase.
+func (m *Manager) syncEvent(evt *state.Event) {
+	if m.supabase == nil || !m.supabase.IsEnabled() {
+		return
+	}
+	ctx := context.Background()
+	if err := m.supabase.SyncEvent(ctx, evt); err != nil {
+		fmt.Printf("Supabase sync event error: %v\n", err)
+	}
+}
+
+// sendApprovalNotification sends a push notification for an approval request.
+func (m *Manager) sendApprovalNotification(approval *state.Approval) {
+	if m.notifClient == nil || !m.notifClient.IsEnabled() {
+		return
+	}
+
+	session, err := m.store.GetSession(approval.SessionID)
+	if err != nil {
+		return
+	}
+
+	notifType := notification.NotificationTypePermission
+	if approval.Type == state.ApprovalTypeRecovery {
+		notifType = notification.NotificationTypePermission // Recovery approvals also need attention
+	}
+
+	payload := notification.CreateNotificationPayload(notifType, session, map[string]interface{}{
+		"approval_id":   approval.ID,
+		"approval_type": string(approval.Type),
+		"title":         approval.Title,
+		"description":   approval.Description,
+	})
+
+	// In a real implementation, we'd fetch user subscriptions from Supabase
+	// For now, we'll use ntfy fallback if configured
+	_ = m.notifClient.Send(nil, payload)
+}
+
+// sendIncidentNotification sends a push notification for an incident.
+func (m *Manager) sendIncidentNotification(inc *state.Incident, notifType notification.NotificationType) {
+	if m.notifClient == nil || !m.notifClient.IsEnabled() {
+		return
+	}
+
+	session, err := m.store.GetSession(inc.SessionID)
+	if err != nil {
+		return
+	}
+
+	payload := notification.CreateNotificationPayload(notifType, session, map[string]interface{}{
+		"incident_id":   inc.ID,
+		"incident_type": inc.Type,
+		"severity":      string(inc.Severity),
+	})
+
+	_ = m.notifClient.Send(nil, payload)
+}
+
 func (m *Manager) ContinueParkedTask(taskID string) error {
 	task, err := m.store.GetTask(taskID)
 	if err != nil {

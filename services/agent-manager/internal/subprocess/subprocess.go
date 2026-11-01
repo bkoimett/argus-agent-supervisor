@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/argus-command-center/argus/services/agent-manager/internal/notification"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/state"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/store"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/supabase"
 )
 
 // OpenCodeConfig holds configuration for OpenCode subprocess.
@@ -30,29 +32,33 @@ type OpenCodeConfig struct {
 
 // ProcessManager manages OpenCode subprocesses.
 type ProcessManager struct {
-	store     *store.Store
-	mu        sync.Mutex
-	processes map[string]*ManagedProcess
-	config    OpenCodeConfig
+	store       *store.Store
+	supabase    *supabase.Client
+	notifClient *notification.Client
+	mu          sync.Mutex
+	processes   map[string]*ManagedProcess
+	config      OpenCodeConfig
 }
 
 // ManagedProcess tracks a running OpenCode process.
 type ManagedProcess struct {
-	SessionID string
-	Cmd       *exec.Cmd
-	Stdout    io.ReadCloser
-	Stderr    io.ReadCloser
-	Cancel    context.CancelFunc
-	PID       int
-	StartTime time.Time
-	EventChan chan *state.Event
-	ErrorChan chan error
-	Done      chan struct{}
-	store     *store.Store
+	SessionID   string
+	Cmd         *exec.Cmd
+	Stdout      io.ReadCloser
+	Stderr      io.ReadCloser
+	Cancel      context.CancelFunc
+	PID         int
+	StartTime   time.Time
+	EventChan   chan *state.Event
+	ErrorChan   chan error
+	Done        chan struct{}
+	store       *store.Store
+	supabase    *supabase.Client
+	notifClient *notification.Client
 }
 
 // NewProcessManager creates a new ProcessManager.
-func NewProcessManager(st *store.Store, config OpenCodeConfig) *ProcessManager {
+func NewProcessManager(st *store.Store, sbClient *supabase.Client, notifClient *notification.Client, config OpenCodeConfig) *ProcessManager {
 	if config.BinaryPath == "" {
 		config.BinaryPath = "opencode"
 	}
@@ -60,9 +66,11 @@ func NewProcessManager(st *store.Store, config OpenCodeConfig) *ProcessManager {
 		config.Timeout = 5 * time.Minute
 	}
 	return &ProcessManager{
-		store:     st,
-		processes: make(map[string]*ManagedProcess),
-		config:    config,
+		store:       st,
+		supabase:    sbClient,
+		notifClient: notifClient,
+		processes:   make(map[string]*ManagedProcess),
+		config:      config,
 	}
 }
 
@@ -120,17 +128,19 @@ func (pm *ProcessManager) StartSession(ctx context.Context, sessionID, projectDi
 	}
 
 	mp := &ManagedProcess{
-		SessionID: sessionID,
-		Cmd:       cmd,
-		Stdout:    stdout,
-		Stderr:    stderr,
-		Cancel:    cancel,
-		PID:       cmd.Process.Pid,
-		StartTime: time.Now(),
-		EventChan: make(chan *state.Event, 100),
-		ErrorChan: make(chan error, 10),
-		Done:      make(chan struct{}),
-		store:     pm.store,
+		SessionID:   sessionID,
+		Cmd:         cmd,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		Cancel:      cancel,
+		PID:         cmd.Process.Pid,
+		StartTime:   time.Now(),
+		EventChan:   make(chan *state.Event, 100),
+		ErrorChan:   make(chan error, 10),
+		Done:        make(chan struct{}),
+		store:       pm.store,
+		supabase:    pm.supabase,
+		notifClient: pm.notifClient,
 	}
 
 	pm.processes[sessionID] = mp
@@ -203,6 +213,13 @@ func (mp *ManagedProcess) readStdout() {
 			if err := mp.store.AppendEvent(event); err != nil {
 				mp.ErrorChan <- fmt.Errorf("persist event: %w", err)
 			}
+			// Sync to Supabase
+			if mp.supabase != nil && mp.supabase.IsEnabled() {
+				ctx := context.Background()
+				if err := mp.supabase.SyncEvent(ctx, event); err != nil {
+					fmt.Printf("Supabase sync event error: %v\n", err)
+				}
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -246,6 +263,27 @@ func (mp *ManagedProcess) wait() {
 		session.EndedAt = &now
 		session.ExitCode = &exitCode
 		mp.store.UpdateSession(session)
+		// Sync to Supabase
+		if mp.supabase != nil && mp.supabase.IsEnabled() {
+			ctx := context.Background()
+			if err := mp.supabase.SyncSession(ctx, session); err != nil {
+				fmt.Printf("Supabase sync session error: %v\n", err)
+			}
+		}
+
+		// Send notification
+		if mp.notifClient != nil && mp.notifClient.IsEnabled() {
+			var notifType notification.NotificationType
+			if exitCode == 0 {
+				notifType = notification.NotificationTypeCompleted
+			} else {
+				notifType = notification.NotificationTypeCrashed
+			}
+			payload := notification.CreateNotificationPayload(notifType, session, map[string]interface{}{
+				"exit_code": exitCode,
+			})
+			_ = mp.notifClient.Send(nil, payload)
+		}
 	}
 
 	// Update tasks for this session

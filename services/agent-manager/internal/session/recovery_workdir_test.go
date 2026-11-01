@@ -28,9 +28,9 @@ func setupTestManager(t *testing.T) (*Manager, *store.Store, string) {
 	t.Cleanup(func() { st.Close() })
 
 	procConfig := subprocess.OpenCodeConfig{BinaryPath: "opencode"}
-	procMgr := subprocess.NewProcessManager(st, procConfig)
+	procMgr := subprocess.NewProcessManager(st, nil, nil, procConfig)
 	metaConfig := meta.DefaultConfig()
-	mgr := NewManager(st, procMgr, metaConfig)
+	mgr := NewManager(st, procMgr, metaConfig, nil, nil)
 
 	projDir := "/tmp/test-wd-" + time.Now().Format("20060102150405.000000000")
 	t.Cleanup(func() { os.RemoveAll(projDir) })

@@ -14,23 +14,58 @@ import (
 
 	"github.com/argus-command-center/argus/services/agent-manager/internal/dashboard"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/meta"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/notification"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/session"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/store"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/subprocess"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/supabase"
 )
 
 func main() {
 	var (
-		dbPath      = flag.String("db", "argus.db", "SQLite database path")
-		port        = flag.String("port", "8080", "HTTP dashboard port")
-		opencodeBin = flag.String("opencode", "opencode", "OpenCode binary path")
-		model       = flag.String("model", "", "Default model (provider/model)")
-		autoApprove = flag.Bool("auto", false, "Auto-approve permissions (DANGEROUS)")
-		metaAPIKey  = flag.String("meta-api-key", "", "Meta API key (enables Meta diagnosis)")
-		metaBaseURL = flag.String("meta-base-url", "https://api.meta.example.com/v1", "Meta API base URL")
-		metaModel   = flag.String("meta-model", "meta-llama-3-70b", "Meta model to use")
+		dbPath         = flag.String("db", "argus.db", "SQLite database path")
+		port           = flag.String("port", "8080", "HTTP dashboard port")
+		opencodeBin    = flag.String("opencode", "opencode", "OpenCode binary path")
+		model          = flag.String("model", "", "Default model (provider/model)")
+		autoApprove    = flag.Bool("auto", false, "Auto-approve permissions (DANGEROUS)")
+		metaAPIKey     = flag.String("meta-api-key", "", "Meta API key (enables Meta diagnosis)")
+		metaBaseURL    = flag.String("meta-base-url", "https://api.meta.example.com/v1", "Meta API base URL")
+		metaModel      = flag.String("meta-model", "meta-llama-3-70b", "Meta model to use")
+		supabaseURL    = flag.String("supabase-url", "", "Supabase project URL")
+		supabaseKey    = flag.String("supabase-key", "", "Supabase anon key")
+		supabaseSvc    = flag.String("supabase-service-key", "", "Supabase service key")
+		notifEnabled   = flag.Bool("notif-enabled", false, "Enable push notifications")
+		notifVAPIDPub  = flag.String("notif-vapid-public", "", "VAPID public key")
+		notifVAPIDPriv = flag.String("notif-vapid-private", "", "VAPID private key")
+		notifVAPIDSub  = flag.String("notif-vapid-subject", "mailto:admin@example.com", "VAPID subject")
+		notifNtfyTopic = flag.String("notif-ntfy-topic", "", "ntfy.sh topic for fallback")
+		notifNtfyURL   = flag.String("notif-ntfy-url", "https://ntfy.sh", "ntfy.sh URL")
 	)
 	flag.Parse()
+
+	// Initialize Supabase client
+	supabaseConfig := supabase.Config{
+		URL:        *supabaseURL,
+		AnonKey:    *supabaseKey,
+		ServiceKey: *supabaseSvc,
+		Enabled:    *supabaseURL != "" && *supabaseKey != "",
+	}
+	sbClient, err := supabase.NewClient(supabaseConfig)
+	if err != nil {
+		log.Fatalf("Failed to create Supabase client: %v", err)
+	}
+	defer sbClient.Close()
+
+	// Initialize notification client
+	notifConfig := notification.Config{
+		VAPIDPublicKey:  *notifVAPIDPub,
+		VAPIDPrivateKey: *notifVAPIDPriv,
+		VAPIDSubject:    *notifVAPIDSub,
+		NtfyTopic:       *notifNtfyTopic,
+		NtfyURL:         *notifNtfyURL,
+		Enabled:         *notifEnabled,
+	}
+	notifClient := notification.NewClient(notifConfig)
 
 	// Initialize store
 	st, err := store.NewStore(*dbPath)
@@ -46,7 +81,7 @@ func main() {
 		AutoApprove: *autoApprove,
 		Timeout:     5 * time.Minute,
 	}
-	procMgr := subprocess.NewProcessManager(st, procConfig)
+	procMgr := subprocess.NewProcessManager(st, sbClient, notifClient, procConfig)
 
 	// Initialize meta config
 	metaConfig := meta.Config{
@@ -57,7 +92,7 @@ func main() {
 	}
 
 	// Initialize session manager
-	mgr := session.NewManager(st, procMgr, metaConfig)
+	mgr := session.NewManager(st, procMgr, metaConfig, sbClient, notifClient)
 
 	// Initialize dashboard server
 	dash := dashboard.NewServer(mgr, st, *port)

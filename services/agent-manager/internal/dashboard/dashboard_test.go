@@ -28,9 +28,9 @@ func setupDashboard(t *testing.T) (*Server, *store.Store, string) {
 	}
 
 	procConfig := subprocess.OpenCodeConfig{BinaryPath: "opencode"}
-	procMgr := subprocess.NewProcessManager(st, procConfig)
+	procMgr := subprocess.NewProcessManager(st, nil, nil, procConfig)
 	metaConfig := meta.DefaultConfig()
-	mgr := session.NewManager(st, procMgr, metaConfig)
+	mgr := session.NewManager(st, procMgr, metaConfig, nil, nil)
 
 	projDir := "/tmp/test-dashboard-" + time.Now().Format("20060102150405.000000000")
 	t.Cleanup(func() { os.RemoveAll(projDir) })

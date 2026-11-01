@@ -68,14 +68,43 @@ func (s *Server) Start() error {
 	// Dashboard summary
 	mux.HandleFunc("/api/dashboard", s.handleDashboard)
 
+	// Wrap with CORS middleware for local development (Vite dev server) and Tauri
+	handler := corsMiddleware(mux)
+
 	server := &http.Server{
 		Addr:         ":" + s.port,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
 	return server.ListenAndServe()
+}
+
+// corsMiddleware adds permissive CORS headers for known local origins.
+func corsMiddleware(next http.Handler) http.Handler {
+	allowed := map[string]bool{
+		"http://localhost:5173": true, // Vite dev server
+		"http://127.0.0.1:5173": true,
+		"http://localhost:8080": true, // Go service self
+		"http://127.0.0.1:8080": true,
+		"tauri://localhost":       true, // Tauri custom scheme (production)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Credentials", "false")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +554,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if sessions == nil {
+		sessions = []*state.Session{}
+	}
 
 	type DashboardSession struct {
 		*state.Session
@@ -535,11 +567,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		RecoveryActions []*state.RecoveryAction `json:"recovery_actions"`
 	}
 
-	var dashboard []DashboardSession
+	dashboard := make([]DashboardSession, 0, len(sessions))
 	for _, sess := range sessions {
 		tasks, _ := s.mgr.GetSessionTasks(sess.ID)
+		if tasks == nil {
+			tasks = []*state.Task{}
+		}
 		incidents, _ := s.mgr.GetSessionIncidents(sess.ID)
+		if incidents == nil {
+			incidents = []*state.Incident{}
+		}
 		approvals, _ := s.store.ListPendingApprovals()
+		if approvals == nil {
+			approvals = []*state.Approval{}
+		}
 		// Filter approvals for this session
 		var sessApprovals []*state.Approval
 		for _, a := range approvals {
@@ -548,7 +589,13 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		events, _ := s.mgr.GetSessionEvents(sess.ID, 20)
+		if events == nil {
+			events = []*state.Event{}
+		}
 		recoveryActions, _ := s.mgr.ListRecoveryActions("")
+		if recoveryActions == nil {
+			recoveryActions = []*state.RecoveryAction{}
+		}
 
 		// Filter recovery actions for this session's incidents
 		var sessRecoveryActions []*state.RecoveryAction
@@ -559,6 +606,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
+		}
+		if sessRecoveryActions == nil {
+			sessRecoveryActions = []*state.RecoveryAction{}
 		}
 
 		dashboard = append(dashboard, DashboardSession{

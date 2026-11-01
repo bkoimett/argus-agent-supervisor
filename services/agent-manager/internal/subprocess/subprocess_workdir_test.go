@@ -62,7 +62,7 @@ echo '{"type":"step_finish","timestamp":1234567891,"sessionID":"test","part":{"r
 		BinaryPath: fakeBin,
 		Timeout:    10 * time.Second,
 	}
-	procMgr := NewProcessManager(st, procConfig)
+	procMgr := NewProcessManager(st, nil, nil, procConfig)
 
 	ctx := context.Background()
 	_, err = procMgr.StartSession(ctx, "test-session-wd", projDir, "test prompt")

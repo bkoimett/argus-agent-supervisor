@@ -209,6 +209,17 @@ type Event struct {
 	Payload   map[string]interface{} `json:"payload"`
 }
 
+// Command represents a command sent from the PWA to the agent.
+type Command struct {
+	ID        string          `json:"id"`
+	SessionID string          `json:"session_id"`
+	Type      string          `json:"type"` // respond_permission, abort, pause, resume, stop
+	Payload   json.RawMessage `json:"payload"`
+	Status    string          `json:"status"` // PENDING, EXECUTED, FAILED
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
 // OpenCodeEvent represents the raw event from opencode run --format=json
 type OpenCodeEvent struct {
 	Type      string                 `json:"type"`
