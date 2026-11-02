@@ -404,8 +404,7 @@ All 6 packages pass `-race` with **no data races detected**.
 
 All V1 acceptance requirements are satisfied and proven by automated tests. All quality gates pass. Race detector clean. No V1-scope features missing or unsafe.
 
----
-## V2 Implementation Progress — 2026-10-31
+### V2 Implementation Progress — 2026-10-31
 
 ### M1: Foundation - Supabase Integration (COMPLETED)
 
@@ -702,3 +701,45 @@ All state transitions now sync to Supabase:
 ---
 
 **Status**: V2 implementation complete. All M1-M6 milestones delivered per PRD. Ready for demo rehearsal.
+
+---
+
+## Dashboard Expand Crash Fix — 2026-11-02
+
+### Root Cause
+
+`services/agent-manager/internal/dashboard/dashboard.go:585-590` declared `sessApprovals` as `var sessApprovals []*state.Approval` (nil). When no pending approvals matched a session, it stayed nil and was JSON-encoded as `"approvals": null`. All other array fields (`tasks`, `incidents`, `events`, `recovery_actions`) had nil-to-empty-slice checks, but `sessApprovals` did not.
+
+`apps/desktop/src/App.tsx:286` called `session.approvals.length` on the null value, throwing `TypeError: Cannot read properties of null (reading 'length')` and blanking the dashboard when Expanding any session.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `services/agent-manager/internal/dashboard/dashboard.go` | Added `if sessApprovals == nil { sessApprovals = []*state.Approval{} }` after the approval-filtering loop, matching the pattern used for all other array fields |
+| `apps/desktop/src/App.tsx` | Guarded all array accesses in SessionCard with `?? []` (tasks, incidents, approvals, recovery_actions, recent_events) as defense-in-depth |
+| `apps/desktop/src/NewSessionForm.tsx` | New file extracted from App.tsx (already in working tree, needed by App.tsx import) |
+
+### Verification
+
+| Check | Command | Result |
+|-------|---------|--------|
+| Go vet | `go vet ./...` | PASS |
+| Go tests | `go test ./...` | PASS (all 8 packages) |
+| Go race | `go test -race ./...` | PASS (all 7 packages, no data races) |
+| Go build | `go build -o agent-manager ./cmd/agent-manager` | PASS |
+| TypeScript | `tsc && vite build` | PASS |
+| Tauri build | `cargo build --release` | PASS (binary produced) |
+
+### Commit
+
+`30ebfba` — `fix(dashboard): prevent null array crash when expanding sessions`
+
+### GUI Checks Still Required
+
+- Open New Session → type path/prompt while polling → verify text preserved
+- Desktop: Click Browse → select directory → verify path populates field
+- Browser: Verify fallback message appears, Browse disabled
+- Expand running session → verify no crash, all sections render
+- Expand completed session → verify no crash, all sections render
+- Session with zero pending approvals → verify `"approvals": []` not `null`
