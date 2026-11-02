@@ -588,6 +588,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 				sessApprovals = append(sessApprovals, a)
 			}
 		}
+		if sessApprovals == nil {
+			sessApprovals = []*state.Approval{}
+		}
 		events, _ := s.mgr.GetSessionEvents(sess.ID, 20)
 		if events == nil {
 			events = []*state.Event{}

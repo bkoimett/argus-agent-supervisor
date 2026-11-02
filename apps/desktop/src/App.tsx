@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { NewSessionForm } from './NewSessionForm'
 
 // Types
 interface Task {
@@ -204,11 +205,11 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
       {expanded && (
         <div className="p-4 space-y-4 border-t border-border">
           {/* Tasks */}
-          {session.tasks.length > 0 && (
+          {(session.tasks ?? []).length > 0 && (
             <div>
               <h4 className="font-medium mb-2">Tasks</h4>
               <div className="space-y-2">
-                {session.tasks.map((task) => (
+                {(session.tasks ?? []).map((task) => (
                   <div key={task.id} className="p-3 bg-background rounded border border-border">
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
@@ -228,11 +229,11 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
 
           {/* Incidents */}
-          {session.incidents.length > 0 && (
+          {(session.incidents ?? []).length > 0 && (
             <div>
               <h4 className="font-medium mb-2">Incidents</h4>
               <div className="space-y-2">
-                {session.incidents.map((inc) => (
+                {(session.incidents ?? []).map((inc) => (
                   <div key={inc.id} className="p-3 bg-background rounded border border-border">
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
@@ -282,11 +283,11 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
 
           {/* Approvals */}
-          {session.approvals.length > 0 && (
+          {(session.approvals ?? []).length > 0 && (
             <div>
               <h4 className="font-medium mb-2">Pending Approvals</h4>
               <div className="space-y-2">
-                {session.approvals.map((appr) => (
+                {(session.approvals ?? []).map((appr) => (
                   <div key={appr.id} className="p-3 bg-background rounded border border-border">
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
@@ -318,11 +319,11 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
 
           {/* Recovery Actions */}
-          {session.recovery_actions && session.recovery_actions.length > 0 && (
+          {(session.recovery_actions ?? []).length > 0 && (
             <div>
               <h4 className="font-medium mb-2">Recovery Actions</h4>
               <div className="space-y-2">
-                {session.recovery_actions.map((ra: any) => (
+                {(session.recovery_actions ?? []).map((ra: any) => (
                   <div key={ra.id} className="p-3 bg-background rounded border border-border">
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex-1 min-w-0">
@@ -369,11 +370,11 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
 
           {/* Recent Events */}
-          {session.recent_events.length > 0 && (
+          {(session.recent_events ?? []).length > 0 && (
             <div>
               <h4 className="font-medium mb-2">Recent Events</h4>
               <div className="font-mono text-xs max-h-64 overflow-auto bg-background rounded border border-border p-2">
-                {session.recent_events.slice().reverse().map((evt, idx) => (
+                {(session.recent_events ?? []).slice().reverse().map((evt, idx) => (
                   <div key={idx} className="py-1 border-b border-border/50 last:border-0">
                     <span className="text-textMuted">{formatTime(evt.timestamp)} </span>
                     <span className="text-info">{evt.type}</span>
@@ -385,58 +386,6 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
         </div>
       )}
-    </div>
-  )
-}
-
-function NewSessionForm({ onSubmit, onClose }: { onSubmit: (dir: string, prompt: string) => void; onClose: () => void }) {
-  const [dir, setDir] = useState('')
-  const [prompt, setPrompt] = useState('')
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    if (dir && prompt) {
-      onSubmit(dir, prompt)
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-surface border border-border rounded-lg p-6 w-full max-w-md mx-4">
-        <h2 className="text-lg font-medium mb-4">New Session</h2>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-1">Project Directory</label>
-            <input
-              type="text"
-              value={dir}
-              onChange={(e) => setDir(e.target.value)}
-              placeholder="/path/to/project"
-              className="w-full bg-surface border border-border rounded text-text"
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Prompt</label>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Describe the task..."
-              rows={3}
-              className="w-full bg-surface border border-border rounded text-text"
-              required
-            />
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
-            <button type="button" onClick={onClose} className="px-4 py-2 bg-surfaceHover hover:bg-border border border-border rounded">
-              Cancel
-            </button>
-            <button type="submit" className="px-4 py-2 bg-accent hover:bg-accentHover text-white rounded">
-              Create Session
-            </button>
-          </div>
-        </form>
-      </div>
     </div>
   )
 }
@@ -466,7 +415,7 @@ export default function App() {
     return () => clearInterval(interval)
   }, [loadDashboard])
 
-  const handleNewSession = async (dir: string, prompt: string) => {
+  const handleNewSession = useCallback(async (dir: string, prompt: string) => {
     try {
       await createSession(dir, prompt)
       setShowNewSession(false)
@@ -474,9 +423,13 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create session')
     }
-  }
+  }, [loadDashboard])
 
-  if (loading && sessions.length === 0) {
+  const handleCloseNewSession = useCallback(() => {
+    setShowNewSession(false)
+  }, [])
+
+  if (loading && sessions.length === 0 && !showNewSession) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center">
@@ -509,23 +462,33 @@ export default function App() {
           </div>
         )}
 
-        {/* Sessions Grid */}
-        {(sessions ?? []).length === 0 ? (
-          <div className="text-center py-12 text-textMuted">
-            <p className="text-lg">No sessions running</p>
-            <p className="text-sm mt-1">Click "New Session" to start an OpenCode agent</p>
-          </div>
-        ) : (
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {sessions.map((session) => (
-              <SessionCard key={session.id} session={session} onRefresh={loadDashboard} />
-            ))}
-          </div>
+        {/* Sessions Grid or Loading */}
+        {!showNewSession && (
+          <>
+            {loading && sessions.length === 0 ? (
+              <div className="text-center py-12 text-textMuted">
+                <p className="text-lg">Loading dashboard...</p>
+              </div>
+            ) : (
+              (sessions ?? []).length === 0 ? (
+                <div className="text-center py-12 text-textMuted">
+                  <p className="text-lg">No sessions running</p>
+                  <p className="text-sm mt-1">Click "New Session" to start an OpenCode agent</p>
+                </div>
+              ) : (
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {sessions.map((session) => (
+                    <SessionCard key={session.id} session={session} onRefresh={loadDashboard} />
+                  ))}
+                </div>
+              )
+            )}
+          </>
         )}
 
         {/* New Session Modal */}
         {showNewSession && (
-          <NewSessionForm onSubmit={handleNewSession} onClose={() => setShowNewSession(false)} />
+          <NewSessionForm onSubmit={handleNewSession} onClose={handleCloseNewSession} />
         )}
       </div>
     </div>
