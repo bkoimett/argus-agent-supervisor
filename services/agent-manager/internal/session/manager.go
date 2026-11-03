@@ -148,9 +148,31 @@ func (m *Manager) ListSessions() ([]*state.Session, error) {
 	return m.store.ListSessions()
 }
 
-// StopSession stops a session.
+// StopSession stops a session. Because OpenCode 1.19.0 `opencode serve` runs a
+// single shared server process across all sessions with no per-session
+// termination endpoint, Stop() cannot confirm the underlying OpenCode process
+// exited. The session is marked DETACHED (not STOPPED): Argus has stopped
+// managing it, but the OpenCode session may still exist on the shared server.
 func (m *Manager) StopSession(sessionID string) error {
-	return m.procMgr.StopSession(sessionID)
+	return m.DetachSession(sessionID)
+}
+
+// DetachSession marks a session as DETACHED in SQLite. This is the terminal
+// state Argus can truthfully assign when it stops tracking a session without
+// being able to confirm OpenCode process termination. The session persists in
+// SQLite so it survives restarts and is visible on the dashboard/PWA.
+func (m *Manager) DetachSession(sessionID string) error {
+	sess, err := m.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("session %s not found: %w", sessionID, err)
+	}
+	sess.Status = state.SessionStatusDetached
+	sess.UpdatedAt = time.Now()
+	if err := m.store.UpdateSession(sess); err != nil {
+		return fmt.Errorf("update session %s: %w", sessionID, err)
+	}
+	m.syncSession(sess)
+	return nil
 }
 
 // GetSessionTasks returns all tasks for a session.
@@ -200,6 +222,28 @@ func (m *Manager) SubmitTask(sessionID, prompt, scope string, dependencies []str
 	resp := make(chan error, 1)
 	m.taskQueue <- &TaskExecution{Task: task, Session: session, Response: resp}
 	return task, <-resp
+}
+
+// SendMessage sends a follow-up message to an existing session by starting
+// a new OpenCode subprocess with the correct working directory. This ensures
+// file operations happen in the session's project directory, not the Argus repo.
+func (m *Manager) SendMessage(ctx context.Context, sessionID, message string) (*state.Session, error) {
+	session, err := m.store.GetSession(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start a subprocess for the follow-up message
+	mp, err := m.procMgr.StartMessageProcess(ctx, sessionID, session.ProjectDir, message)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for the subprocess to complete
+	<-mp.Done
+
+	// Return updated session
+	return m.store.GetSession(sessionID)
 }
 
 // RequestApproval creates an approval request with duplicate/stale detection.
@@ -666,6 +710,8 @@ func (m *Manager) verifyCommandIntegrity(command string, args []string) bool {
 			return true
 		case len(args) == 2 && args[0] == "mod" && args[1] == "verify":
 			return true
+		case len(args) == 2 && args[0] == "mod" && args[1] == "tidy":
+			return true
 		default:
 			return false
 		}
@@ -914,19 +960,23 @@ func getExitCode(payload map[string]interface{}) float64 {
 
 func getToolOutput(payload map[string]interface{}) string {
 	// New normalized format
-	if output, ok := payload["tool_output"].(string); ok {
+	if output, ok := payload["tool_output"].(string); ok && output != "" {
 		return output
 	}
-	if output, ok := payload["metadata_output"].(string); ok {
+	if output, ok := payload["metadata_output"].(string); ok && output != "" {
+		return output
+	}
+	// Fallback: check for output at top level (test agent format)
+	if output, ok := payload["output"].(string); ok && output != "" {
 		return output
 	}
 	// Old format: check state.output and state.metadata.output
 	if stateData, ok := payload["state"].(map[string]interface{}); ok {
-		if output, ok := stateData["output"].(string); ok {
+		if output, ok := stateData["output"].(string); ok && output != "" {
 			return output
 		}
 		if metadata, ok := stateData["metadata"].(map[string]interface{}); ok {
-			if output, ok := metadata["output"].(string); ok {
+			if output, ok := metadata["output"].(string); ok && output != "" {
 				return output
 			}
 		}
@@ -976,6 +1026,7 @@ func (m *Manager) classifyBashFailure(event *state.Event, payload map[string]int
 		"missing dependency", "cannot find module", "finding module", "no matching version",
 		"module not found", "package not found", "could not import",
 		"import error", "missing package",
+		"no required module provides package",
 	}) {
 		return m.createIncidentFromError(event, payload, "missing_dependency")
 	}
@@ -1052,7 +1103,7 @@ func (m *Manager) createIncidentFromError(event *state.Event, stateData map[stri
 	} else if strings.Contains(output, "FAIL") || strings.Contains(output, "Test failed") || strings.Contains(output, "assertion failed") {
 		incidentType = "test_failure"
 		severity = state.IncidentSeverityHigh
-	} else if strings.Contains(output, "missing dependency") || strings.Contains(output, "cannot find module") || strings.Contains(output, "finding module") || strings.Contains(output, "no matching version") {
+	} else if strings.Contains(output, "missing dependency") || strings.Contains(output, "cannot find module") || strings.Contains(output, "finding module") || strings.Contains(output, "no matching version") || strings.Contains(output, "no required module provides package") {
 		incidentType = "missing_dependency"
 		severity = state.IncidentSeverityHigh
 	}
@@ -1089,7 +1140,7 @@ func (m *Manager) IncidentKey(incidentType string, output string) string {
 	if strings.Contains(output, "FAIL") || strings.Contains(output, "Test failed") {
 		keyParts = append(keyParts, "test_failure")
 	}
-	if strings.Contains(output, "missing dependency") || strings.Contains(output, "cannot find module") || strings.Contains(output, "finding module") {
+	if strings.Contains(output, "missing dependency") || strings.Contains(output, "cannot find module") || strings.Contains(output, "finding module") || strings.Contains(output, "no required module provides package") {
 		keyParts = append(keyParts, "missing_dep")
 	}
 	if strings.Contains(output, "connection reset") || strings.Contains(output, "ECONNRESET") {
@@ -1133,6 +1184,80 @@ func payloadGetString(payload map[string]interface{}, key string) string {
 		return v
 	}
 	return ""
+}
+
+// RestoreSessions reconciles sessions that were running when the service stopped.
+// OpenCode processes are not children of the GUI and do not survive service
+// restarts, so sessions in non-terminal states are marked DISCONNECTED. The
+// user can then choose to restore (start a new session for the same project)
+// or dismiss (mark as STOPPED).
+func (m *Manager) RestoreSessions() error {
+	sessions, err := m.store.ListSessions()
+	if err != nil {
+		return err
+	}
+
+	for _, sess := range sessions {
+		switch sess.Status {
+		case state.SessionStatusStarting,
+			state.SessionStatusRunning,
+			state.SessionStatusWaiting,
+			state.SessionStatusParked,
+			state.SessionStatusPaused:
+			sess.Status = state.SessionStatusDisconnected
+			sess.UpdatedAt = time.Now()
+			if err := m.store.UpdateSession(sess); err != nil {
+				fmt.Printf("failed to mark session %s as disconnected: %v\n", sess.ID, err)
+				continue
+			}
+			m.syncSession(sess)
+		}
+	}
+	return nil
+}
+
+// RestoreSession creates a new session for the same project as the given
+// session. The original OpenCode process cannot be reattached (opencode run
+// is one-shot, opencode serve is unstable), so a fresh session is started.
+// The original session is marked DETACHED (not STOPPED): Argus cannot confirm
+// the original OpenCode process terminated, only that it is no longer managed.
+func (m *Manager) RestoreSession(sessionID string) (*state.Session, *state.Task, error) {
+	origSess, err := m.store.GetSession(sessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session %s not found: %w", sessionID, err)
+	}
+
+	if origSess.Status != state.SessionStatusDisconnected && origSess.Status != state.SessionStatusDetached {
+		return nil, nil, fmt.Errorf("session %s is not in DISCONNECTED or DETACHED state (current: %s)", sessionID, origSess.Status)
+	}
+
+	// Get the most recent task for the original session to recover the prompt
+	tasks, err := m.store.ListTasksBySession(sessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get tasks for session %s: %w", sessionID, err)
+	}
+
+	var prompt string
+	if len(tasks) > 0 {
+		prompt = tasks[len(tasks)-1].Prompt
+	}
+
+	// Mark original session as DETACHED (not STOPPED — cannot confirm
+	// OpenCode process termination on the shared serve process).
+	origSess.Status = state.SessionStatusDetached
+	origSess.UpdatedAt = time.Now()
+	if err := m.store.UpdateSession(origSess); err != nil {
+		return nil, nil, fmt.Errorf("update original session: %w", err)
+	}
+	m.syncSession(origSess)
+
+	// Create a new session for the same project
+	newSess, newTask, err := m.CreateSession(context.Background(), origSess.ProjectDir, origSess.Model, prompt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create restored session: %w", err)
+	}
+
+	return newSess, newTask, nil
 }
 
 // ContinueParkedTask resumes a task after approval.
@@ -1206,6 +1331,14 @@ func (m *Manager) syncEvent(evt *state.Event) {
 // sendApprovalNotification sends a push notification for an approval request.
 func (m *Manager) sendApprovalNotification(approval *state.Approval) {
 	if m.notifClient == nil || !m.notifClient.IsEnabled() {
+		return
+	}
+
+	// Permission notifications are end-to-end unverified; do not send them.
+	// The OpenCode permission reply path has not been demonstrated with a live
+	// request, so sending permission notifications could imply a capability
+	// that does not exist.
+	if approval.Type == state.ApprovalTypePermission {
 		return
 	}
 

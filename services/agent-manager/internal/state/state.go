@@ -21,6 +21,7 @@ const (
 	SessionStatusCrashed      SessionStatus = "CRASHED"
 	SessionStatusDisconnected SessionStatus = "DISCONNECTED"
 	SessionStatusStopped      SessionStatus = "STOPPED"
+	SessionStatusDetached     SessionStatus = "DETACHED" // Argus stopped tracking but cannot confirm OpenCode process termination (shared serve process has no per-session kill endpoint). Conflicts with PRD §10 state list; documented in PROGRESS.md.
 )
 
 // TaskStatus represents the state of a task within a session.

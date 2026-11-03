@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { NewSessionForm } from './NewSessionForm'
+import SessionChat from './SessionChat'
 
 // Types
 interface Task {
@@ -83,13 +84,27 @@ async function fetchDashboard(): Promise<DashboardData[]> {
   return res.json()
 }
 
-async function createSession(projectDir: string, prompt: string): Promise<void> {
+async function createSession(projectDir: string, prompt: string): Promise<{ session_id: string; session: DashboardData }> {
   const res = await fetch(`${API_BASE}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_dir: projectDir, prompt }),
   })
-  if (!res.ok) throw new Error('Failed to create session')
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || 'Failed to create session')
+  }
+  return res.json()
+}
+
+async function apiHealth(): Promise<{ status: string; started_at: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(2000) })
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
+  }
 }
 
 async function stopSession(sessionId: string): Promise<void> {
@@ -99,38 +114,11 @@ async function stopSession(sessionId: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to stop session')
 }
 
-async function respondApproval(approvalId: string, approved: boolean): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/approvals/${approvalId}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ approved, decided_by: 'desktop' }),
-  })
-  if (!res.ok) throw new Error('Failed to respond to approval')
-}
-
-async function diagnoseIncident(incidentId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/diagnosis`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ incident_id: incidentId }),
-  })
-  if (!res.ok) throw new Error('Failed to diagnose incident')
-}
-
-async function requestRecoveryApproval(recoveryId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/recovery/approval`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ recovery_id: recoveryId }),
-  })
-  if (!res.ok) throw new Error('Failed to request recovery approval')
-}
-
-async function executeRecovery(recoveryId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/recovery/${recoveryId}`, {
+async function restoreSession(sessionId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/restore`, {
     method: 'POST',
   })
-  if (!res.ok) throw new Error('Failed to execute recovery')
+  if (!res.ok) throw new Error('Failed to restore session')
 }
 
 function statusClass(status: string): string {
@@ -146,6 +134,7 @@ function statusClass(status: string): string {
     case 'crashed': return 'bg-red-500/20 text-red-400'
     case 'disconnected': return 'bg-gray-500/20 text-gray-400'
     case 'stopped': return 'bg-gray-500/20 text-gray-400'
+    case 'detached': return 'bg-gray-500/20 text-gray-400'
     case 'pending': return 'bg-blue-500/20 text-blue-400'
     case 'recovering': return 'bg-purple-500/20 text-purple-400'
     case 'verified': return 'bg-green-500/20 text-green-400'
@@ -159,17 +148,25 @@ function statusClass(status: string): string {
   }
 }
 
-function formatTime(dateStr: string | null): string {
-  if (!dateStr) return ''
-  const date = new Date(dateStr)
-  return date.toLocaleTimeString()
-}
+function SessionCard({
+  session,
+  onRefresh,
+  onSelect,
+}: {
+  session: DashboardData
+  onRefresh: () => void
+  onSelect?: () => void
+}) {
+  const handleRestore = () => {
+    restoreSession(session.id).then(onRefresh)
+  }
 
-function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh: () => void }) {
-  const [expanded, setExpanded] = useState(false)
+  const handleStop = () => {
+    stopSession(session.id).then(onRefresh)
+  }
 
   return (
-    <div className="bg-surface border border-border rounded-lg overflow-hidden">
+    <div className="bg-surface border border-border rounded-lg overflow-hidden cursor-pointer hover:border-accent/50 transition-border" onClick={onSelect}>
       {/* Session Header */}
       <div className="p-4 border-b border-border flex flex-wrap items-center gap-4">
         <div className="flex-1 min-w-[200px]">
@@ -185,208 +182,103 @@ function SessionCard({ session, onRefresh }: { session: DashboardData; onRefresh
           )}
         </div>
         <div className="flex gap-2">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="px-3 py-1 text-sm bg-surfaceHover hover:bg-border border border-border rounded"
-          >
-            {expanded ? 'Collapse' : 'Expand'}
-          </button>
-          <button
-            onClick={() => stopSession(session.id).then(onRefresh)}
-            disabled={session.status === 'COMPLETED' || session.status === 'STOPPED' || session.status === 'ERROR'}
-            className="px-3 py-1 text-sm bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 rounded disabled:opacity-50"
-          >
-            Stop
-          </button>
+          {session.status === 'DISCONNECTED' || session.status === 'STOPPED' || session.status === 'DETACHED' ? (
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleRestore()
+                }}
+                className="px-3 py-1 text-sm bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded"
+              >
+                Restore
+              </button>
+              {session.status === 'DISCONNECTED' && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleStop()
+                  }}
+                  className="px-3 py-1 text-sm bg-gray-500/20 hover:bg-gray-500/30 text-gray-400 border border-gray-500/30 rounded"
+                >
+                  Dismiss
+                </button>
+              )}
+              {session.status === 'DETACHED' && (
+                <p className="text-xs text-textMuted mt-1">
+                  Argus stopped tracking this session but cannot confirm the OpenCode process ended. It may still be running.
+                </p>
+              )}
+            </>
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                handleStop()
+              }}
+              disabled={session.status === 'COMPLETED' || session.status === 'STOPPED' || session.status === 'ERROR' || session.status === 'DETACHED'}
+              className="px-3 py-1 text-sm bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 rounded disabled:opacity-50"
+            >
+              Stop
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Expanded Content */}
-      {expanded && (
-        <div className="p-4 space-y-4 border-t border-border">
-          {/* Tasks */}
-          {(session.tasks ?? []).length > 0 && (
-            <div>
-              <h4 className="font-medium mb-2">Tasks</h4>
-              <div className="space-y-2">
-                {(session.tasks ?? []).map((task) => (
-                  <div key={task.id} className="p-3 bg-background rounded border border-border">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="font-mono text-sm text-textMuted">{task.prompt}</div>
-                        <div className="flex items-center gap-2 mt-1">
-                          <span className={`px-2 py-0.5 rounded text-xs ${statusClass(task.status)}`}>
-                            {task.status}
-                          </span>
-                          <span className="font-mono text-xs text-textMuted">Scope: {task.scope}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Incidents */}
-          {(session.incidents ?? []).length > 0 && (
-            <div>
-              <h4 className="font-medium mb-2">Incidents</h4>
-              <div className="space-y-2">
-                {(session.incidents ?? []).map((inc) => (
-                  <div key={inc.id} className="p-3 bg-background rounded border border-border">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium">{inc.type}</span>
-                          <span className={`px-2 py-0.5 rounded text-xs ${statusClass(inc.status)}`}>
-                            {inc.status}
-                          </span>
-                          <span className={`px-2 py-0.5 rounded text-xs bg-gray-500/20 text-gray-400`}>
-                            {inc.severity}
-                          </span>
-                        </div>
-                        <div className="font-mono text-xs text-textMuted mt-1 max-h-32 overflow-auto">
-                          {inc.evidence}
-                        </div>
-                        {inc.meta_diagnosis && (
-                          <div className="mt-2 p-2 bg-blue-500/10 rounded border border-blue-500/20 text-sm">
-                            <strong>Diagnosis:</strong> {inc.meta_diagnosis}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        {inc.status === 'PROPOSED' && (
-                          <>
-                            <button
-                              onClick={() => diagnoseIncident(inc.id).then(onRefresh)}
-                              className="px-3 py-1 text-sm bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded"
-                            >
-                              Diagnose
-                            </button>
-                          </>
-                        )}
-                        {inc.status === 'APPROVED' && (
-                          <button
-                            onClick={() => executeRecovery(inc.id).then(onRefresh)}
-                            className="px-3 py-1 text-sm bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 rounded"
-                          >
-                            Execute Recovery
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Approvals */}
-          {(session.approvals ?? []).length > 0 && (
-            <div>
-              <h4 className="font-medium mb-2">Pending Approvals</h4>
-              <div className="space-y-2">
-                {(session.approvals ?? []).map((appr) => (
-                  <div key={appr.id} className="p-3 bg-background rounded border border-border">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="font-medium">{appr.title}</div>
-                        <div className="text-sm text-textMuted mt-1">{appr.description}</div>
-                        <div className="font-mono text-xs text-textMuted mt-1 max-h-24 overflow-auto">
-                          {appr.payload}
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => respondApproval(appr.id, true).then(onRefresh)}
-                          className="px-3 py-1 text-sm bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 rounded"
-                        >
-                          Approve
-                        </button>
-                        <button
-                          onClick={() => respondApproval(appr.id, false).then(onRefresh)}
-                          className="px-3 py-1 text-sm bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 rounded"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Recovery Actions */}
-          {(session.recovery_actions ?? []).length > 0 && (
-            <div>
-              <h4 className="font-medium mb-2">Recovery Actions</h4>
-              <div className="space-y-2">
-                {(session.recovery_actions ?? []).map((ra: any) => (
-                  <div key={ra.id} className="p-3 bg-background rounded border border-border">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium">{ra.type}</span>
-                          <span className={`px-2 py-0.5 rounded text-xs ${statusClass(ra.status)}`}>
-                            {ra.status}
-                          </span>
-                        </div>
-                        <div className="text-sm text-textMuted mt-1">{ra.description}</div>
-                        <div className="font-mono text-xs text-textMuted mt-1">
-                          <code>{ra.command} {ra.args?.join(' ') || ''}</code>
-                        </div>
-                        {ra.result && (
-                          <div className="mt-2 p-2 bg-background rounded border border-border text-sm">
-                            <div>Exit: {ra.result.exit_code} | {ra.result.status}</div>
-                            <div className="font-mono text-xs max-h-24 overflow-auto mt-1">{ra.result.stdout}</div>
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        {ra.status === 'PROPOSED' && (
-                          <button
-                            onClick={() => requestRecoveryApproval(ra.id).then(onRefresh)}
-                            className="px-3 py-1 text-sm bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded"
-                          >
-                            Request Approval
-                          </button>
-                        )}
-                        {ra.status === 'APPROVED' && (
-                          <button
-                            onClick={() => executeRecovery(ra.id).then(onRefresh)}
-                            className="px-3 py-1 text-sm bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 rounded"
-                          >
-                            Execute
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Recent Events */}
-          {(session.recent_events ?? []).length > 0 && (
-            <div>
-              <h4 className="font-medium mb-2">Recent Events</h4>
-              <div className="font-mono text-xs max-h-64 overflow-auto bg-background rounded border border-border p-2">
-                {(session.recent_events ?? []).slice().reverse().map((evt, idx) => (
-                  <div key={idx} className="py-1 border-b border-border/50 last:border-0">
-                    <span className="text-textMuted">{formatTime(evt.timestamp)} </span>
-                    <span className="text-info">{evt.type}</span>
-                    <pre className="inline text-textMuted ml-2">{JSON.stringify(evt.payload).slice(0, 200)}</pre>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
+  )
+}
+
+const LIVE_STATES = new Set(['STARTING', 'RUNNING', 'WAITING', 'PARKED', 'PAUSED'])
+const DISCONNECTED_STATES = new Set(['DISCONNECTED', 'DETACHED'])
+const PAST_STATES = new Set(['COMPLETED', 'ERROR', 'CRASHED', 'STOPPED'])
+
+function sessionKind(status: string): 'live' | 'disconnected' | 'past' {
+  const s = status.toUpperCase()
+  if (LIVE_STATES.has(s)) return 'live'
+  if (DISCONNECTED_STATES.has(s)) return 'disconnected'
+  if (PAST_STATES.has(s)) return 'past'
+  // Unknown status: Argus cannot confirm the OpenCode process stopped,
+  // so treat it honestly as disconnected rather than past/stopped.
+  return 'disconnected'
+}
+
+function SessionSection({
+  title,
+  sessions,
+  onRefresh,
+  onSelect,
+  note,
+}: {
+  title: string
+  sessions: DashboardData[]
+  onRefresh: () => void
+  onSelect: (session: DashboardData) => void
+  note?: string
+}) {
+  if (sessions.length === 0) return null
+
+  return (
+    <section className="mb-8">
+      <div className="flex items-center gap-2 mb-3">
+        <h2 className="text-sm font-medium text-textMuted uppercase tracking-wider">{title}</h2>
+        {note && (
+          <span className="text-xs text-textMuted bg-surface/50 px-2 py-0.5 rounded border border-border/50">
+            {note}
+          </span>
+        )}
+      </div>
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {sessions.map((session) => (
+          <SessionCard
+            key={session.id}
+            session={session}
+            onRefresh={onRefresh}
+            onSelect={() => onSelect(session)}
+          />
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -394,18 +286,38 @@ export default function App() {
   const [sessions, setSessions] = useState<DashboardData[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [apiConnected, setApiConnected] = useState<boolean | null>(null)
   const [showNewSession, setShowNewSession] = useState(false)
+  const [selectedSession, setSelectedSession] = useState<DashboardData | null>(null)
+  const [createError, setCreateError] = useState<string | null>(null)
+  const [createSuccess, setCreateSuccess] = useState<string | null>(null)
+
+  const liveSessions = useMemo(
+    () => (sessions ?? []).filter((s) => sessionKind(s.status) === 'live'),
+    [sessions]
+  )
+  const disconnectedSessions = useMemo(
+    () => (sessions ?? []).filter((s) => sessionKind(s.status) === 'disconnected'),
+    [sessions]
+  )
+  const pastSessions = useMemo(
+    () => (sessions ?? []).filter((s) => sessionKind(s.status) === 'past'),
+    [sessions]
+  )
 
   const loadDashboard = useCallback(async () => {
+    let ok = false
     try {
       setLoading(true)
       const data = await fetchDashboard()
       setSessions(data)
       setError(null)
+      ok = true
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
       setLoading(false)
+      setApiConnected(ok)
     }
   }, [])
 
@@ -415,18 +327,36 @@ export default function App() {
     return () => clearInterval(interval)
   }, [loadDashboard])
 
+  useEffect(() => {
+    // Periodically confirm the Go service is reachable so the UI never
+    // silently presents stale data as a fresh connection.
+    const check = () => {
+      apiHealth().then((h) => setApiConnected(h !== null))
+    }
+    check()
+    const iv = setInterval(check, 10000)
+    return () => clearInterval(iv)
+  }, [])
+
   const handleNewSession = useCallback(async (dir: string, prompt: string) => {
+    setCreateError(null)
+    setCreateSuccess(null)
     try {
       await createSession(dir, prompt)
       setShowNewSession(false)
+      setCreateSuccess('Session created.')
+      setTimeout(() => setCreateSuccess(null), 3000)
       loadDashboard()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create session')
+      // Keep the modal open and surface the error inline in the form.
+      setCreateError(err instanceof Error ? err.message : 'Failed to create session')
     }
   }, [loadDashboard])
 
   const handleCloseNewSession = useCallback(() => {
     setShowNewSession(false)
+    setCreateError(null)
+    setCreateSuccess(null)
   }, [])
 
   if (loading && sessions.length === 0 && !showNewSession) {
@@ -445,7 +375,22 @@ export default function App() {
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
-          <h1 className="text-2xl font-medium">Argus Dashboard</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-medium">Argus Dashboard</h1>
+            {apiConnected === null ? (
+              <span className="text-xs text-textMuted animate-pulse">connecting…</span>
+            ) : apiConnected ? (
+              <span className="flex items-center gap-1 text-xs text-green-400">
+                <span className="w-1.5 h-1.5 bg-green-500 rounded-full"></span>
+                connected
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-xs text-red-400">
+                <span className="w-1.5 h-1.5 bg-red-500 rounded-full"></span>
+                Go service unreachable
+              </span>
+            )}
+          </div>
           <button
             onClick={() => setShowNewSession(true)}
             className="px-4 py-2 bg-accent hover:bg-accentHover text-white rounded font-medium"
@@ -462,33 +407,83 @@ export default function App() {
           </div>
         )}
 
-        {/* Sessions Grid or Loading */}
+        {/* Create-session success */}
+        {createSuccess && (
+          <div className="mb-4 p-4 bg-green-500/10 border border-green-500/20 rounded text-green-400 flex items-center justify-between">
+            <span>{createSuccess}</span>
+            <button onClick={() => setCreateSuccess(null)} className="text-green-400 hover:text-green-300">×</button>
+          </div>
+        )}
+
+        {/* Sessions by lifecycle: live, disconnected, past */}
         {!showNewSession && (
           <>
-            {loading && sessions.length === 0 ? (
-              <div className="text-center py-12 text-textMuted">
-                <p className="text-lg">Loading dashboard...</p>
+            {selectedSession ? (
+              <div className="max-w-4xl mx-auto">
+                <button
+                  onClick={() => setSelectedSession(null)}
+                  className="mb-4 inline-flex items-center gap-2 text-sm text-textMuted hover:text-text"
+                >
+                  ← Back to sessions
+                </button>
+                <SessionChat
+                  sessionId={selectedSession.id}
+                  projectDir={selectedSession.project_dir}
+                  agent={selectedSession.agent}
+                  status={selectedSession.status}
+                  onStatusChange={(s) => {
+                    setSelectedSession((prev) =>
+                      prev ? { ...prev, status: s } : null
+                    )
+                  }}
+                  onClose={() => setSelectedSession(null)}
+                />
               </div>
             ) : (
-              (sessions ?? []).length === 0 ? (
-                <div className="text-center py-12 text-textMuted">
-                  <p className="text-lg">No sessions running</p>
-                  <p className="text-sm mt-1">Click "New Session" to start an OpenCode agent</p>
-                </div>
-              ) : (
-                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                  {sessions.map((session) => (
-                    <SessionCard key={session.id} session={session} onRefresh={loadDashboard} />
-                  ))}
-                </div>
-              )
+              <>
+                {loading && sessions.length === 0 ? (
+                  <div className="text-center py-12 text-textMuted">
+                    <p className="text-lg">Loading dashboard...</p>
+                  </div>
+                ) : (
+                  (sessions ?? []).length === 0 ? (
+                    <div className="text-center py-12 text-textMuted">
+                      <p className="text-lg">No sessions</p>
+                      <p className="text-sm mt-1">Click "New Session" to start an OpenCode agent</p>
+                    </div>
+                  ) : (
+                    <>
+                      <SessionSection
+                        title="Live"
+                        sessions={liveSessions}
+                        onRefresh={loadDashboard}
+                        onSelect={(s) => setSelectedSession(s)}
+                        note="Argus is actively managing these sessions. Status updates as OpenCode emits events."
+                      />
+                      <SessionSection
+                        title="Disconnected"
+                        sessions={disconnectedSessions}
+                        onRefresh={loadDashboard}
+                        onSelect={(s) => setSelectedSession(s)}
+                        note="Argus lost contact with, or stopped tracking, these sessions. It cannot confirm the OpenCode process ended, so they may still be running."
+                      />
+                      <SessionSection
+                        title="Past"
+                        sessions={pastSessions}
+                        onRefresh={loadDashboard}
+                        onSelect={(s) => setSelectedSession(s)}
+                      />
+                    </>
+                  )
+                )}
+              </>
             )}
           </>
         )}
 
         {/* New Session Modal */}
         {showNewSession && (
-          <NewSessionForm onSubmit={handleNewSession} onClose={handleCloseNewSession} />
+          <NewSessionForm onSubmit={handleNewSession} onClose={handleCloseNewSession} serverError={createError} />
         )}
       </div>
     </div>

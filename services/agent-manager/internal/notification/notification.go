@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SherClockHolmes/webpush-go"
@@ -26,6 +27,12 @@ type Config struct {
 	// ntfy.sh fallback
 	NtfyTopic string
 	NtfyURL   string // default: https://ntfy.sh
+
+	// NtfyAllowBroadcast permits sending to the ntfy topic without a specific
+	// subscription. When false (default), Send() with no subscription returns
+	// an error instead of broadcasting to the ntfy topic. This prevents
+	// unintended broadcast of session data to arbitrary subscribers.
+	NtfyAllowBroadcast bool
 
 	Enabled bool
 }
@@ -48,6 +55,9 @@ type NotificationPayload struct {
 	Tag                string                 `json:"tag,omitempty"`
 	Data               map[string]interface{} `json:"data,omitempty"`
 	RequireInteraction bool                   `json:"requireInteraction,omitempty"`
+	// DedupKey is an optional stable key for idempotent delivery. If empty,
+	// one is generated from session ID + notification type + entity ID.
+	DedupKey string `json:"-"`
 }
 
 // NotificationType represents the type of notification.
@@ -67,6 +77,8 @@ const (
 type Client struct {
 	config     Config
 	httpClient *http.Client
+	dedupMu    sync.Mutex
+	dedupSent  map[string]bool // dedup key → already sent
 }
 
 // NewClient creates a new notification client.
@@ -77,6 +89,7 @@ func NewClient(config Config) *Client {
 	return &Client{
 		config:     config,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
+		dedupSent:  make(map[string]bool),
 	}
 }
 
@@ -195,6 +208,22 @@ func (c *Client) SendNtfy(payload NotificationPayload) error {
 
 // Send sends a notification via web push (with ntfy fallback).
 func (c *Client) Send(sub *Subscription, payload NotificationPayload) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+
+	// Dedup check: skip if this notification was already sent
+	dedupKey := payload.DedupKey
+	if dedupKey == "" {
+		dedupKey = generateDedupKey(payload)
+	}
+	c.dedupMu.Lock()
+	if c.dedupSent[dedupKey] {
+		return nil // already sent
+	}
+	c.dedupSent[dedupKey] = true
+	c.dedupMu.Unlock()
+
 	// Try web push first if subscription exists
 	if sub != nil && c.config.VAPIDPrivateKey != "" && c.config.VAPIDPublicKey != "" {
 		err := c.SendWebPush(*sub, payload)
@@ -206,22 +235,44 @@ func (c *Client) Send(sub *Subscription, payload NotificationPayload) error {
 
 	// Fallback to ntfy
 	if c.config.NtfyTopic != "" {
+		if sub == nil && !c.config.NtfyAllowBroadcast {
+			return fmt.Errorf("no subscription and ntfy broadcast disabled")
+		}
+		// Strip sensitive fields when broadcasting without a specific target
+		if sub == nil {
+			payload = stripSensitiveFields(payload)
+		}
 		return c.SendNtfy(payload)
 	}
 
 	return fmt.Errorf("no notification method available")
 }
 
+// stripSensitiveFields returns a copy of the payload with potentially
+// sensitive fields removed, for safe broadcast over ntfy without a
+// specific subscription target.
+func stripSensitiveFields(payload NotificationPayload) NotificationPayload {
+	stripped := payload
+	stripped.Data = make(map[string]interface{})
+	for k, v := range payload.Data {
+		if k == "session_id" || k == "project" {
+			continue // strip session identifiers and project paths
+		}
+		stripped.Data[k] = v
+	}
+	return stripped
+}
+
 // SendToUser sends a notification to a user via all their subscriptions.
 func (c *Client) SendToUser(ctx context.Context, userID string, subs []Subscription, payload NotificationPayload) error {
 	if len(subs) == 0 {
-		// No subscriptions, try ntfy
-		return c.SendNtfy(payload)
+		// No subscriptions, try ntfy broadcast (may be disabled)
+		return c.Send(nil, payload)
 	}
 
 	var lastErr error
 	for _, sub := range subs {
-		err := c.SendWebPush(sub, payload)
+		err := c.Send(&sub, payload)
 		if err == nil {
 			return nil
 		}
@@ -230,10 +281,26 @@ func (c *Client) SendToUser(ctx context.Context, userID string, subs []Subscript
 
 	// All web push failed, try ntfy
 	if c.config.NtfyTopic != "" {
-		return c.SendNtfy(payload)
+		return c.Send(nil, payload)
 	}
 
 	return lastErr
+}
+
+// generateDedupKey builds a stable dedup key from the notification payload.
+// Format: sessionID:notifType[:entityID] where entityID is incident_id or
+// approval_id when available. This ensures the same logical notification
+// (same session, same type, same target entity) is only sent once.
+func generateDedupKey(payload NotificationPayload) string {
+	sessionID, _ := payload.Data["session_id"].(string)
+	notifType, _ := payload.Data["type"].(string)
+	key := sessionID + ":" + notifType
+	if entityID, ok := payload.Data["incident_id"].(string); ok && entityID != "" {
+		key += ":" + entityID
+	} else if entityID, ok := payload.Data["approval_id"].(string); ok && entityID != "" {
+		key += ":" + entityID
+	}
+	return key
 }
 
 // CreateNotificationPayload creates a notification payload from an event.
@@ -278,6 +345,9 @@ func CreateNotificationPayload(notifType NotificationType, session *state.Sessio
 	for k, v := range details {
 		base.Data[k] = v
 	}
+
+	// Set dedup key for idempotent delivery
+	base.DedupKey = generateDedupKey(base)
 
 	return base
 }

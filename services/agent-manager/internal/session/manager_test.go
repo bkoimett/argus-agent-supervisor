@@ -545,3 +545,92 @@ func TestDuplicateDecisionApproveThenReject(t *testing.T) {
 		t.Errorf("recovery action not approved: %s", ra.Status)
 	}
 }
+
+// TestManagerStopSessionMarksDetached verifies StopSession marks the session
+// DETACHED (not STOPPED) in SQLite, and the state persists.
+func TestManagerStopSessionMarksDetached(t *testing.T) {
+	mgr, st, projDir := setupManager(t)
+
+	session, _, err := mgr.CreateSession(context.Background(), projDir, "", "test prompt")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if session.Status != state.SessionStatusRunning {
+		t.Fatalf("expected RUNNING after create, got %s", session.Status)
+	}
+
+	// Stop the session.
+	if err := mgr.StopSession(session.ID); err != nil {
+		t.Fatalf("StopSession failed: %v", err)
+	}
+
+	// Verify DETACHED in SQLite.
+	sess, err := st.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if sess.Status != state.SessionStatusDetached {
+		t.Errorf("expected DETACHED after StopSession, got %s", sess.Status)
+	}
+
+	// Stop again — idempotent.
+	if err := mgr.StopSession(session.ID); err != nil {
+		t.Errorf("second StopSession should be idempotent, got: %v", err)
+	}
+	sess, err = st.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if sess.Status != state.SessionStatusDetached {
+		t.Errorf("expected DETACHED after repeated StopSession, got %s", sess.Status)
+	}
+}
+
+// TestManagerStopSessionUnknown verifies StopSession on an unknown session
+// returns an error.
+func TestManagerStopSessionUnknown(t *testing.T) {
+	mgr, _, _ := setupManager(t)
+
+	err := mgr.StopSession("nonexistent-session-id")
+	if err == nil {
+		t.Fatal("expected error stopping unknown session")
+	}
+}
+
+// TestManagerRestoreSessionMarksOriginalDetached verifies RestoreSession marks
+// the original session DETACHED (not STOPPED) and creates a new session.
+func TestManagerRestoreSessionMarksOriginalDetached(t *testing.T) {
+	mgr, st, projDir := setupManager(t)
+
+	session, _, err := mgr.CreateSession(context.Background(), projDir, "", "test prompt")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// First mark as DISCONNECTED (simulating restart recovery).
+	session.Status = state.SessionStatusDisconnected
+	if err := st.UpdateSession(session); err != nil {
+		t.Fatalf("UpdateSession failed: %v", err)
+	}
+
+	// Restore the session.
+	newSess, _, err := mgr.RestoreSession(session.ID)
+	if err != nil {
+		t.Fatalf("RestoreSession failed: %v", err)
+	}
+	if newSess.ID == session.ID {
+		t.Fatal("expected a new session ID, got the original")
+	}
+	if newSess.Status != state.SessionStatusRunning {
+		t.Errorf("expected new session RUNNING, got %s", newSess.Status)
+	}
+
+	// Original session should be DETACHED (not STOPPED).
+	orig, err := st.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if orig.Status != state.SessionStatusDetached {
+		t.Errorf("expected original session DETACHED after restore, got %s", orig.Status)
+	}
+}

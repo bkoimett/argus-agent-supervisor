@@ -166,3 +166,10 @@ apps/pwa/public/
 
 # Local environment files (already ignored .env, .env.* but keep .env.example)
 !.env.example
+
+
+
+services/agent-manager/agent-manager
+*.db
+*.db-shm
+*.db-wal

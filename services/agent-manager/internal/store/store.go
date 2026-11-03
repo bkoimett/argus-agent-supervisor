@@ -731,7 +731,7 @@ func (s *Store) AppendEvent(event *state.Event) error {
 
 func (s *Store) GetEvents(sessionID string, limit int) ([]*state.Event, error) {
 	rows, err := s.db.Query(`
-		SELECT session_id, type, timestamp, payload FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT ?
+		SELECT session_id, type, timestamp, payload FROM events WHERE session_id=? ORDER BY timestamp ASC LIMIT ?
 	`, sessionID, limit)
 	if err != nil {
 		return nil, err

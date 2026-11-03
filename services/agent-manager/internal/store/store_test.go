@@ -165,6 +165,65 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestStoreGetEventsOrdering(t *testing.T) {
+	dbPath := "/tmp/test_store_events_order_" + time.Now().Format("20060102150405") + ".db"
+	defer os.Remove(dbPath)
+
+	st, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	session := &state.Session{
+		ID:         "test-session-events",
+		ProjectDir: "/tmp/test",
+		Agent:      "opencode",
+		Status:     state.SessionStatusRunning,
+		StartedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := st.CreateSession(session); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	base := time.Now()
+	// Insert three events with deliberately out-of-order timestamps to verify
+	// GetEvents returns them sorted oldest-first (ASC).
+	events := []*state.Event{
+		{SessionID: session.ID, Type: "tool_use", Timestamp: base.Add(2 * time.Second), Payload: map[string]interface{}{"seq": 3}},
+		{SessionID: session.ID, Type: "user_message", Timestamp: base, Payload: map[string]interface{}{"seq": 1}},
+		{SessionID: session.ID, Type: "assistant_message", Timestamp: base.Add(time.Second), Payload: map[string]interface{}{"seq": 2}},
+	}
+	for _, e := range events {
+		if err := st.AppendEvent(e); err != nil {
+			t.Fatalf("AppendEvent failed: %v", err)
+		}
+	}
+
+	got, err := st.GetEvents(session.ID, 10)
+	if err != nil {
+		t.Fatalf("GetEvents failed: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("Expected 3 events, got %d", len(got))
+	}
+	// Timestamps must be non-decreasing (oldest first).
+	for i := 1; i < len(got); i++ {
+		if got[i].Timestamp.Before(got[i-1].Timestamp) {
+			t.Errorf("Events not in ascending timestamp order: event %d (%v) before event %d (%v)",
+				i-1, got[i-1].Timestamp, i, got[i].Timestamp)
+		}
+	}
+	// Verify the first event is the user_message (earliest timestamp).
+	if got[0].Type != "user_message" {
+		t.Errorf("First event type = %q, want user_message", got[0].Type)
+	}
+	if got[2].Type != "tool_use" {
+		t.Errorf("Last event type = %q, want tool_use", got[2].Type)
+	}
+}
+
 func TestStoreListSessions(t *testing.T) {
 	dbPath := "/tmp/test_store_list_" + time.Now().Format("20060102150405") + ".db"
 	defer os.Remove(dbPath)

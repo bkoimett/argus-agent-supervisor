@@ -275,11 +275,11 @@ cmd.Dir = sess.ProjectDir
 
 | Capability | Verified? | Notes |
 |------------|-----------|-------|
-| `opencode run --format=json` | ✅ Yes | Core execution path |
+| `opencode run --format=json` | ✅ Yes | Core execution path (one-shot, no follow-up) |
 | Structured event stream + persistence | ✅ Yes | Parsed, stored, queryable |
 | `--auto` flag | ⚠️ Exists, disabled by default | Security risk — not used in demo |
-| `opencode serve` / SSE / ACP | ❌ No | Unstable / non-functional |
-| Programmatic permission response | ❌ No | No API exists |
+| `opencode serve` + REST + SSE (1.19.0) | ✅ Yes | Headless server; `POST /session/{id}/message` for follow-up; `GET /api/event` SSE stream; ACP **not probed** |
+| Programmatic permission reply (1.19.0) | ⚠️ Contract only | `POST /api/session/{id}/permission/{req}/reply {reply,message}` confirmed from frontend source; **end-to-end unverified** — no live permission request triggered in probe |
 | Native permission pausing | ❌ No | Argus manages approvals externally |
 | Session pause/resume via CLI | ❌ No | Not supported |
 
@@ -527,39 +527,49 @@ All state transitions now sync to Supabase:
 
 ---
 
-### M5: Push Notifications (COMPLETED)
+### M5: Push Notifications (IMPLEMENTED — 2026-11-02)
 
-#### Completed Components
+#### Goal
+Implement reliable notification delivery for session completion and errors, with deduplication and ntfy.sh fallback delivery.
 
-| Component | File | Status |
-|-----------|------|--------|
-| Web Push (VAPID) client | `internal/notification/notification.go` | ✅ |
-| ntfy.sh fallback | `internal/notification/notification.go` | ✅ |
-| Notification types (needs_input, permission, completed, crashed, error, quota_warning, disconnected) | `internal/notification/notification.go` | ✅ |
-| VAPID key generation utility | `internal/notification/notification.go` | ✅ |
-| Preferences model with per-type toggles | `internal/notification/notification.go` | ✅ |
-| Integration with SessionManager | `internal/session/manager.go` | ✅ |
-| Integration with ProcessManager | `internal/subprocess/subprocess.go` | ✅ |
-| CLI flags for notification config | `cmd/agent-manager/main.go` | ✅ |
+#### What was implemented
 
-#### Notification Triggers Implemented
+**Go service (`services/agent-manager/`):**
 
-- **Session completion** → `NotificationTypeCompleted`
-- **Session crash/error** → `NotificationTypeCrashed` / `NotificationTypeError`
-- **New incident detected** → `NotificationTypeError`
-- **Approval request (permission/recovery)** → `NotificationTypePermission`
-- **Session disconnected** → `NotificationTypeDisconnected`
+- `internal/notification/notification.go` — Added deduplication cache (`dedupSent` map + `dedupMu` mutex) to `Client` struct. `Send()` and `SendToUser()` now check dedup key before sending. Added `generateDedupKey()` function that builds keys from `sessionID:notifType[:entityID]`. `CreateNotificationPayload()` now auto-populates `DedupKey`.
+- `internal/session/manager.go` — Already calls `sendApprovalNotification()` (permission requests) and `sendIncidentNotification()` (errors) at appropriate points. `subprocess.go` `wait()` already sends `Completed`/`Crashed` on process exit. No changes needed — notification plumbing was already wired.
+- `internal/subprocess/subprocess.go` — `wait()` sends `NotificationTypeCompleted` (exit 0) or `NotificationTypeCrashed` (non-zero exit) via `notifClient.Send()` at process exit. `DetectIncidentsFromEvents()` sends `NotificationTypeError` for detected incidents. Both paths are naturally deduplicated (process exits once, incidents use `FindSimilarIncident` dedup).
+- `cmd/agent-manager/main.go` — Already wires `notifClient` with `--notif-enabled`, `--notif-vapid-*`, `--notif-ntfy-*` flags.
 
-#### Verified Working
+**PWA UI (`apps/pwa/src/`):**
 
-- Go build: ✅ PASS
-- Web Push uses `webpush-go` library with VAPID
-- ntfy.sh fallback works without VAPID keys
-- Notifications disabled by default (requires `--notif-enabled`)
-- Non-blocking send (errors logged only)
-- Preferences model ready for UI integration
+- `App.tsx` — Added `SettingsScreen` notification preferences section with per-type toggles (needs_input, permission, completed, crashed, error, quota_warning, disconnected). Preferences auto-save to `localStorage` on change via `useEffect`.
 
----
+#### Verified (quality gates)
+
+- `go test -race -count=1 ./...` — PASS (all 9 packages including `internal/notification`)
+- `go vet ./...` — PASS
+- `go build ./...` — PASS
+- `gofmt` — clean
+- PWA `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (12 tests including 4 new notification preference tests)
+- Desktop `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (8 tests)
+
+#### Notification delivery (delivery path decision)
+
+Per PRD §8, notifications support "Web Push (VAPID, free) or ntfy.sh (open source, self-hostable)". For M5:
+
+- **Primary delivery:** `ntfy.sh` via HTTP POST. The HTTP request format is simple to verify against the real ntfy.sh service (no VAPID key generation, no browser push subscription, no service worker required).
+- **Web Push (VAPID):** Infrastructure exists in `notification.go` (`SendWebPush`, `GenerateVAPIDKeys`) but is not end-to-end testable without a real browser push subscription. Kept as fallback path per PRD.
+- **Fallback logic:** `Send()` tries web push first (if VAPID keys + subscription available), falls back to ntfy.sh. `SendToUser()` iterates subscriptions, falls back to ntfy if all fail.
+
+#### Honest gaps (not disguised as features)
+
+- **Live delivery not verified end-to-end:** The ntfy.sh request format was exercised against the real service via `curl` (see M6 notification verification), but the full completion → ntfy → phone receipt/display path was **not** observed end-to-end. No VAPID keys or browser push subscription configured in the test environment. Do not claim the completion-to-phone path was verified.
+- **No per-user/device targeting:** Notifications are sent with `nil` subscription → falls through to ntfy topic broadcast. Anyone subscribed to the ntfy topic receives notifications. User/device-targeted delivery requires Supabase auth + push subscription storage (not yet implemented). RLS policies on `notification_preferences` are permissive (`using (true)`).
+- **Permission notifications:** `NotificationTypePermission` is sent via `sendApprovalNotification()`, but end-to-end permission handling remains UNVERIFIED (no live OpenCode permission request triggerable). PWA Approve/Reject buttons remain disabled with "not available" explanation.
+- **No notification preferences stored in Supabase:** Preferences are stored in PWA `localStorage` only. Supabase `notification_preferences` table exists but is not written to.
+- **`--notif-enabled` flag required:** Notifications are disabled by default. Must pass `--notif-enabled --notif-ntfy-topic=<topic>` to enable ntfy.sh delivery.
+
 
 ### Validation Suite Results (2026-10-31)
 
@@ -743,3 +753,333 @@ All state transitions now sync to Supabase:
 - Expand running session → verify no crash, all sections render
 - Expand completed session → verify no crash, all sections render
 - Session with zero pending approvals → verify `"approvals": []` not `null`
+
+---
+
+## OpenCode Serve Spike (M2 adapter) — 2026-11-02
+
+### Goal
+Prove the technical foundation for interactive OpenCode sessions: start a persistent session, receive assistant text, send a follow-up message to the same session, stop and report final state. Backend-only; no chat UI.
+
+### Verified probe results (OpenCode 1.19.0)
+Recorded in `services/agent-manager/OPENCODE_COMPATIBILITY_PROBE.md`. Summary:
+
+| Question | Verified? | Evidence |
+|---|---|---|
+| Running session receives another user message | Yes | `POST /session/{sessionID}/message` ×5 on same session ID |
+| Interface/protocol | Yes | `opencode serve` headless server + REST API |
+| Assistant message delivery | Yes | inline `parts` + SSE `message.part.updated` on `GET /api/event` |
+| Permission response sending | Contract only | `POST /api/session/{sessionID}/permission/{requestID}/reply {reply,message}` |
+| Session continues after turn | Yes | 5-turn same-session loop |
+| Session after interruption | Yes (live) | `POST /session/{sessionID}/interrupt` stops the current turn; session retained |
+
+### Implementation
+- `internal/adapter/adapter.go` — Added `MessageResult`, `MessagePart`, `TokenUsage`; changed `SendMessage` to return `(MessageResult, error)`; added `Interrupt`; concurrency fix: capture `ServeClient` under lock before HTTP calls so a racing `Close()` cannot nil-pointer-dereference.
+- `internal/adapter/opencode.go` — `OpenCodeAdapter` owns a detached `opencode serve` process (lazy, shared across sessions); implements Start/SendMessage/Status/Stop/Restart/Abort/Interrupt/RespondToPermission/GetEvents/Close.
+- `internal/adapter/opencode_client.go` (new) — `ServeClient`: spawns `opencode serve --port 0` in its own process group (`Setpgid`), parses port from stdout, HTTP client for session/message/interrupt/permission endpoints; `Close()` kills the process group and verifies the tracked PID is reaped (no orphan server).
+- `internal/adapter/opencode_test.go` (new) — Focused tests with `httptest.Server` mock: create session, send message + parse response, unknown-session failures, stop → stopped status, permission reply plumbing, multi-part text preservation.
+- `internal/adapter/opencode_integration_test.go` (new, `//go:build integration`) — Live checks against real OpenCode 1.19.0 (not run in default CI): start → initial prompt → follow-up on same session → interrupt state → permission plumbing (400, no live request) → clean server shutdown; concurrent starts; Close racing SendMessage (no nil-pointer panic).
+
+### Lifecycle decision (documented in code)
+The Go agent-manager owns one long-lived, detached `opencode serve` process, started lazily on first `Start()` and shared across all sessions. It is never a child of the GUI (PRD §14). Sessions are created via `POST /api/session`; messages via `POST /session/{sessionID}/message`; interrupt via `POST /session/{sessionID}/interrupt`. Auto-approval is off by default.
+
+### Gaps (honest, not disguised as features)
+- End-to-end permission handling is **UNVERIFIED**: no live permission request was triggered or answered (harmless prompts do not prompt; `RespondToPermission` returns 400 for a nonexistent request). The reply path is contract-only plumbing.
+- `GET /api/session/{sessionID}/event` session-specific stream behavior not fully characterized; the adapter relies on inline response parts.
+- `opencode acp` and `opencode attach` not probed.
+
+### Automated tests (httptest mock, run in default CI)
+- `go test -race ./internal/adapter/`: PASS
+- Full module `go test -race ./...`: PASS (all packages)
+- `go vet ./...`: PASS
+- `go build ./...`: PASS
+- `gofmt`: PASS for adapter files (`internal/dashboard/dashboard.go` pre-existing flag, untouched)
+
+### Live integration checks (real OpenCode 1.19.0, `go test -tags integration`)
+All PASS against the installed binary:
+- `TestIntegrationStartSendFollowupStop`: session created; initial prompt returns assistant text; follow-up on same session ID returns assistant text; interrupt leaves session WORKING (retained); `RespondToPermission` returns 400 (no live request — permission unverified); tracked serve PID shut down cleanly after Close.
+- `TestIntegrationConcurrentStarts`: 3 concurrent `Start()` calls produce 3 distinct sessions, no panic or map corruption.
+- `TestIntegrationCloseWhileSending`: `Close()` racing an in-flight `SendMessage()` completes without nil-pointer panic.
+
+### Remaining gaps
+- End-to-end permission approve/deny: not demonstrated (no live request triggerable with harmless prompts).
+- `opencode acp` / `opencode attach`: not probed.
+
+---
+
+## Chat-First Session Slice (Phase 2) — 2026-11-02
+
+### Scope
+Smallest complete, usable chat-first session experience consistent with the PRD and agreed UX direction. Backend (Go) + desktop UI only; no PWA changes in this slice.
+
+### What was implemented
+**Go service (`services/agent-manager/`):**
+- `cmd/agent-manager/main.go` — instantiates `OpenCodeAdapter` (headless `opencode serve`, detached process per PRD §14) and passes it to the dashboard server; closes the adapter on shutdown.
+- `internal/dashboard/dashboard.go` — `Server` holds the adapter; new endpoints:
+  - `POST /api/sessions` — creates a session via `adapter.Start` + records in SQLite, sends initial prompt if provided.
+  - `POST /api/sessions/{id}/message` — sends a follow-up via `adapter.SendMessage`; persists user + assistant exchange to SQLite as `user_message`/`assistant_message` events (readable via `GET /api/events?session_id=`).
+  - `POST /api/sessions/{id}/interrupt` — stops the current turn; session retained (`WORKING`).
+  - `DELETE /api/sessions/{id}` — ends the session (`STOPPED`).
+- `internal/adapter/adapter.go` — `MessageResult`, `SendMessage` returns `(MessageResult, error)`, `Interrupt`, `Status` (WORKING/STOPPED).
+
+**Desktop UI (`apps/desktop/src/`):**
+- `SessionChat.tsx` — conversation timeline (user + assistant bubbles), compact collapsible tool/activity block (hidden by default), prominent errors, distinct "Interrupt current work" and "End session" buttons, composer with text input + send.
+  - Fix: `handleSend` preserves user input on failure (no silent text loss), shows visible error message, allows retry without retyping.
+  - Fix: `sending` state prevents duplicate submissions while a request is in flight.
+- `App.tsx` — clicking a session opens the chat view; grid remains the session list; `SessionCard` gained an `onSelect` prop.
+- `SessionChat.test.tsx` (new) — 8 vitest + @testing-library/react tests: header rendering, action buttons, follow-up send + assistant response display, duplicate send prevention, error + retry, empty input disable, activity block.
+- `vite.config.ts` — added vitest config (jsdom environment, globals, setup file).
+- `package.json` — added `vitest@2`, `@testing-library/react`, `@testing-library/jest-dom`, `jsdom` as dev dependencies; added `test` script.
+
+### Verified (live, real OpenCode 1.19.0)
+- `go test -tags integration ./internal/adapter/`: PASS — start → initial prompt → follow-up on same session ID → interrupt (session retained) → clean server shutdown.
+- `go test -race ./...`: PASS (all packages).
+- `go vet ./...`: PASS; `go build ./...`: PASS; `gofmt`: clean.
+- Desktop `tsc --noEmit`: PASS; `npm run build`: PASS; `npx vitest run`: PASS (8 tests).
+- Permission reply plumbing (mock-based): `TestServeClientReplyPermissionVerifiesBody`, `TestAdapterRespondToPermissionVerifyReplyBody`, `TestAdapterRespondToPermissionFailClosedUnknownSession` — all PASS. Verifies `approve`/`deny` reply body and fail-closed on unknown session. End-to-end permission with a live request remains unverified (see gap above).
+
+### Honest gaps (not disguised as features)
+- End-to-end permission approve/deny: **UNVERIFIED** — no live permission request could be triggered through `opencode serve` in this install. Shell commands auto-succeed; file operations outside the project cause sessions to hang instead of emitting `permission.asked` events. The reply endpoint (`POST /api/session/{sessionID}/permission/{requestID}/reply` with `{"reply":"approve"|"deny","message":"..."}`) and SSE event type `permission.asked` exist in the OpenCode frontend code and are confirmed from the bundle, but no live request/response cycle was observed. Mock-based tests verify the reply plumbing and fail-closed behavior for unknown sessions. See `services/agent-manager/OPENCODE_COMPATIBILITY_PROBE.md` for exact commands and observed output.
+- Session states: adapter reports only `WORKING`/`STOPPED`; `WAITING`/`PERMISSION_REQUIRED`/`PAUSED`/`COMPLETED`/`ERROR`/`CRASHED`/`DISCONNECTED` not detectable from the serve API (documented gap).
+- Pause/resume: not supported by OpenCode (probe); explicitly not claimed.
+- History survives service restarts via SQLite (adapter persists events); does not yet survive a full `opencode serve` restart (serve restarts = new server process).
+- Permission UI is **absent** — no approve/deny buttons in the chat view until real permission events are verified end-to-end (PRD §11 requires notifications for permission requests, but end-to-end handling is unverified).
+
+### Docs staleness (noted, not rewritten in full)
+- `docs/BUILD_PLAN.md`: "Current Focus: M0-02" is stale; uses M0 numbering not in PRD.
+- `docs/MILESTONES.md`: M0-01/M0-02 numbering not aligned with PRD M1-M6; M2 criteria reference `opencode run`/stdin follow-up, which the probe proved does not work.
+- `docs/PROGRESS.md`: contains historical V1/V2 "complete" claims that predate the serve-based adapter; superseded by this section.
+
+---
+
+## Phone Companion Flow (M4) — 2026-11-02
+
+### Goal
+Implement the smallest complete phone companion flow required by the PRD:
+- Pair a phone with the desktop Argus instance through Supabase Realtime.
+- Show the paired desktop's sessions and their latest known state.
+- Let the user open a session, read its conversation/update, and send a response that reaches the same persistent agent session.
+- Reflect the response and subsequent agent result back on desktop and phone.
+
+### What was implemented
+
+**Database migration (`supabase/migrations/0001_init.sql`):**
+- Added `pairing_codes` table (was missing; referenced by `GeneratePairingCode`/`ValidatePairingCode` but not in schema).
+- Added RLS for `pairing_codes`.
+
+**Go service (`services/agent-manager/`):**
+- `internal/supabase/client.go` — Added `SyncCommand(ctx, cmd)` (insert/update command) and `ListPendingCommands(ctx)` (query PENDING commands). Added `stringValue` helper. Added `encoding/json` import.
+- `internal/dashboard/dashboard.go` — `Server` now holds `sbClient *supabase.Client`. `NewServer` takes sbClient as 5th param. `POST /api/sessions` now syncs the created session to Supabase via `sbClient.SyncSession`. Added `POST /api/pairing-code` endpoint that calls `GeneratePairingCode` and returns the code.
+- `cmd/agent-manager/main.go` — Passes `sbClient` to `dashboard.NewServer`. Starts a `processCommands` goroutine (when Supabase is enabled) that polls `ListPendingCommands` every 2s and executes them via the adapter. Command types: `send_message` (calls `adapter.SendMessage`, persists user+assistant events), `stop`/`abort` (calls `adapter.Stop`). Uses a `commandStore` interface for testability.
+- `cmd/agent-manager/main_test.go` (new) — 5 tests for `processCommand`: send_message success, stop, unknown type (FAILED), invalid payload (FAILED), adapter error (FAILED).
+- `internal/dashboard/dashboard_test.go` — Added `TestHandlePairingCodeNoSupabase` (503 when disabled, 405 for GET).
+
+**Desktop UI (`apps/desktop/src/`):**
+- Already had `SessionChat.tsx` with conversation timeline, composer, Interrupt/End session buttons. No changes needed — the dashboard API endpoints already exist.
+
+**PWA UI (`apps/pwa/src/`):**
+- `App.tsx` — Added `ChatEvent` type. Added `fetchSessionEvents()` and `sendCommandToSession()` helper functions (exported for testing, accept optional `sb` parameter). Added `SessionDetailScreen` component with conversation timeline + composer. Added `selectedSession` state and `session-detail` view. `SessionList` items are now clickable (new `onSessionSelect` prop). Approve/Reject buttons call `e.stopPropagation()` to avoid triggering session selection on approval clicks.
+- `App.test.tsx` (new) — 6 tests for `fetchSessionEvents` (events returned, empty on error, empty when no client) and `sendCommandToSession` (success, failure, no client).
+- `vite.config.ts` — Added vitest config (jsdom, globals, setup file).
+- `package.json` — Added `vitest@2`, `@testing-library/react`, `@testing-library/jest-dom`, `jsdom` as dev dependencies; added `test` script.
+- `src/test/setup.ts` (new) — Vitest setup with `@testing-library/jest-dom`.
+
+### Verified (all quality gates)
+- `go test -race -count=1 ./...` — PASS (all 8 packages)
+- `go vet ./...` — PASS
+- `go build ./...` — PASS
+- `gofmt` — clean
+- Desktop `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (8 tests)
+- PWA `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (10 tests)
+
+### Honest gaps (not disguised as features)
+- End-to-end permission approve/deny: **UNVERIFIED** — no live permission request could be triggered through `opencode serve`. Shell commands auto-succeed; file operations outside the project cause sessions to hang instead of emitting `permission.asked` events. The reply endpoint (`POST /api/session/{sessionID}/permission/{requestID}/reply` with `{"reply":"approve"|"deny","message":"..."}`) and SSE event type `permission.asked` exist in the OpenCode frontend code and are confirmed from the bundle, but no live request/response cycle was observed. Mock-based tests verify the reply plumbing and fail-closed behavior for unknown sessions. In the PWA, Approve/Reject buttons are rendered **disabled** with a "not available yet" explanation until a live request can be triggered and answered. See `services/agent-manager/OPENCODE_COMPATIBILITY_PROBE.md` for exact commands and observed output.
+- Session states: adapter reports only `WORKING`/`STOPPED`; `WAITING`/`PERMISSION_REQUIRED`/`PAUSED`/`COMPLETED`/`ERROR`/`CRASHED`/`DISCONNECTED` not detectable from the serve API (documented gap).
+- Pause/resume: not supported by OpenCode (probe); explicitly not claimed.
+- History survives service restarts via SQLite (adapter persists events); does not yet survive a full `opencode serve` restart (serve restarts = new server process).
+- Supabase is disabled by default (`--supabase-url`/`--supabase-key` not set). The M4 phone flow requires Supabase to be enabled. Without it, `GeneratePairingCode` returns an error and command processing is skipped.
+- `opencode acp` / `opencode attach` not probed.
+
+### Schema fix: Supabase session synchronization (this session)
+The Supabase schema had a type mismatch that prevented session sync:
+- `sessions.id` was `uuid` but OpenCode session IDs are text strings like `ses_...`
+- `sessions.project_id` was `uuid NOT NULL REFERENCES projects(id)` but no project row is ever created by the adapter
+- `events.session_id` / `commands.session_id` were `uuid` referencing `sessions.id`
+- `SyncSession` sent `project_dir` but the column was `project_id`
+- RLS was enabled with NO policies (all access denied)
+
+Fixes applied:
+- `supabase/migrations/0001_init.sql`: `sessions.id` → `text`; added `sessions.project_dir text not null default ''`; `sessions.project_id` → nullable; `events.session_id` / `commands.session_id` → `text`; added permissive RLS policies for `authenticated` role (TODO: scope to `auth.uid()` once auth is integrated)
+- `internal/supabase/client.go`: `SyncSession` now correctly targets the `project_dir` column that exists in the schema
+- `internal/supabase/client_test.go` (new): `TestSyncSessionDisabled` (no-op when disabled), `TestSessionIDIsText` (verifies non-UUID session IDs work)
+
+### PWA permission controls (this session)
+- `apps/pwa/src/App.tsx`: Approve/Reject buttons in `SessionList` are now rendered **disabled** (visual opacity reduction, `disabled` attribute) with a "not available yet" explanation (`PERMISSIONS_UNVERIFIED` constant). `onRespondApproval` is still wired but buttons cannot be clicked (disabled attribute prevents click events). No fake approval/success states are implied.
+- `apps/pwa/src/App.test.tsx` (expanded): 4 new tests for SessionList permission controls — buttons disabled, explanation text rendered, click handlers not invoked when disabled, nothing rendered when no approvals. Total PWA tests: 10.
+
+### Docs staleness (noted, not rewritten in full)
+- `docs/BUILD_PLAN.md`: "Current Focus: M0-02" is stale; uses M0 numbering not in PRD.
+- `docs/MILESTONES.md`: M4 criteria updated to reflect actual implementation status (pairing code generation, command processing implemented; permission response unverified).
+
+---
+
+## Desktop Session Restore (M6) — 2026-11-02
+
+### Goal
+Implement the PRD §14 reliability requirement: when the Go service restarts, sessions that were running are detected and the user is offered a way to restore or dismiss them. OpenCode processes are never children of the GUI and do not survive service restarts.
+
+### What was implemented
+
+**Go service (`services/agent-manager/`):**
+
+- `internal/session/manager.go` — Added `RestoreSessions()` which scans all sessions in non-terminal states (`STARTING`, `RUNNING`, `WAITING`, `PARKED`, `PAUSED`) and marks them `DISCONNECTED`. Added `RestoreSession(sessionID)` which marks the original session `STOPPED`, then creates a new session for the same project directory using the most recent task's prompt. The original OpenCode session cannot be reattached (OpenCode CLI is one-shot; `opencode serve` is unstable/unverified), so a fresh session is started. Returns both the new session and task.
+
+- `internal/dashboard/dashboard.go` — Added `POST /api/sessions/{id}/restore` endpoint that calls `adapter.RestoreSession` and returns the new session and task.
+
+- `cmd/agent-manager/main.go` — Calls `mgr.RestoreSessions()` on startup before starting the dashboard server, so sessions that were running before a restart are marked `DISCONNECTED` and available for restoration.
+
+**Desktop UI (`apps/desktop/src/`):**
+
+- `App.tsx` — `SessionCard` shows "Restore" button for `DISCONNECTED` or `STOPPED` sessions. "Stop" button is shown for all other states. "Dismiss" button is shown for `DISCONNECTED` sessions (marks as `STOPPED`). Restore/Stop/Dismiss buttons call the corresponding API endpoints and refresh on completion.
+
+**Tests:**
+- `cmd/agent-manager/main_test.go` (existing) — 5 tests for `processCommand`: send_message success, stop, unknown type (FAILED), invalid payload (FAILED), adapter error (FAILED).
+
+### Verified (all quality gates)
+- `go test -race -count=1 ./...` — PASS (all 9 packages including `internal/notification`)
+- `go vet ./...` — PASS
+- `go build ./...` — PASS
+- `gofmt` — clean
+- Desktop `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (8 tests)
+- PWA `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (12 tests)
+
+### Live notification integration check (M6) — 2026-11-02
+
+### Notification verification — reported at three distinct levels
+
+1. **HTTP mock / contract test (unit):** `internal/notification/notification_test.go` uses an `httptest.Server` mock returning 200. Verifies dedup (same dedupKey sent once), disabled client no-send, missing-topic error, dedup-key generation, and payload dedup-key population. No network involved.
+
+2. **Successful POST to a real ntfy topic:** `ServeClient.SendNtfy()` builds an HTTP POST to `http://ntfy.sh/{topic}` with `Title`, `Priority: high`, `Tags: warning`. The request format was exercised against the real ntfy.sh service via `curl`, returning HTTP 200 with `{"id":"...","type":"message",...}`. This confirms the **outbound HTTP request is well-formed and accepted by ntfy.sh**. It does **not** confirm the Go service sent it in a live flow, nor that a device received/displayed it.
+
+3. **Actual receipt/display on the PWA/device:** **NOT verified.** No VAPID keys or ntfy topic are configured in the test environment, no browser push subscription exists, and no completion/crash event was observed end-to-end (OpenCode sessions take minutes to initialize, so no live completion event occurred). The full completion → ntfy → phone receipt/display path was **not** observed end-to-end and is **not** claimed.
+
+**Go service notification flow (plumbing, not live-triggered):** No live OpenCode permission or completion event was observed because OpenCode sessions took too long to complete. The plumbing is verified via mock/unit tests:
+- `ServeClient.ReplyPermission()` sends `POST /api/session/{sessionID}/permission/{requestID}/reply` with `{"reply":"approve","message":""}` — verified with `httptest.Server` mock.
+- `ServeClient.SendNtfy()` builds the ntfy.sh POST — request format verified against real ntfy.sh via `curl` (level 2 above).
+- `ServeClient.Send()` with `nil` subscription and `NtfyAllowBroadcast: false` returns error `"no subscription and ntfy broadcast disabled"` — verified in unit test.
+- Deduplication: same `dedupKey` sent twice results in only 1 HTTP call — verified in unit test.
+
+**Notification payload safety:** When broadcasting via ntfy without a specific subscription (no user targeting), `stripSensitiveFields()` removes `session_id` and `project` from the payload to avoid leaking session identifiers or project paths.
+
+### Honest gaps (not disguised as features)
+- End-to-end permission approve/deny: **UNVERIFIED** — no live permission request could be triggered through `opencode serve`. Shell commands auto-succeed; file operations outside the project cause sessions to hang instead of emitting `permission.asked` events. In the PWA, Approve/Reject buttons are rendered **disabled** with a "not available yet" explanation.
+- Session restore: OpenCode sessions cannot be truly reattached after service restart (OpenCode CLI `run` is one-shot, `opencode serve` is unstable/unverified). A new session is created for the same project with the most recent task's prompt. Conversation history from the original session is preserved in SQLite events.
+- Session states: adapter reports only `WORKING`/`STOPPED`/`DISCONNECTED`; `WAITING`/`PERMISSION_REQUIRED`/`PAUSED`/`COMPLETED`/`ERROR`/`CRASHED` not detectable from serve API.
+- Supabase is disabled by default (`--supabase-url`/`--supabase-key` not set). The M4 phone flow requires Supabase to be enabled.
+- `opencode acp` / `opencode attach` not probed.
+
+### Schema fix: Supabase session synchronization (this session)
+The Supabase schema had a type mismatch that prevented session sync:
+- `sessions.id` was `uuid` but OpenCode session IDs are text strings like `ses_...`
+- `sessions.project_id` was `uuid NOT NULL REFERENCES projects(id)` but no project row is ever created by the adapter
+- `events.session_id` / `commands.session_id` were `uuid` referencing `sessions.id`
+- `SyncSession` sent `project_dir` but the column was `project_id`
+- RLS was enabled with NO policies (all access denied)
+
+Fixes applied:
+- `supabase/migrations/0001_init.sql`: `sessions.id` → `text`; added `sessions.project_dir text not null default ''`; `sessions.project_id` → nullable; `events.session_id` / `commands.session_id` → `text`; added permissive RLS policies for `authenticated` role (TODO: scope to `auth.uid()` once auth is integrated)
+- `internal/supabase/client.go`: `SyncSession` now correctly targets the `project_dir` column that exists in the schema
+- `internal/supabase/client_test.go` (new): `TestSyncSessionDisabled` (no-op when disabled), `TestSessionIDIsText` (verifies non-UUID session IDs work)
+
+### PWA permission controls (this session)
+- `apps/pwa/src/App.tsx`: Approve/Reject buttons in `SessionList` are now rendered **disabled** (visual opacity reduction, `disabled` attribute) with a "not available yet" explanation (`PERMISSIONS_UNVERIFIED` constant). `onRespondApproval` is still wired but buttons cannot be clicked (disabled attribute prevents click events). No fake approval/success states are implied.
+- `apps/pwa/src/App.test.tsx` (expanded): 4 new tests for SessionList permission controls — buttons disabled, explanation text rendered, click handlers not invoked when disabled, nothing rendered when no approvals. Total PWA tests: 12.
+
+### Notification safety (this session)
+- `internal/notification/notification.go` — Added `NtfyAllowBroadcast` config flag. `Send()` with `nil` subscription returns error unless `NtfyAllowBroadcast` is true. `SendNtfy` path strips sensitive fields (`session_id`, `project`) from payload when broadcasting without a specific subscription target. `SendApprovalNotification` in `manager.go` skips sending `Permission` type notifications since permission handling is unverified.
+- `services/agent-manager/internal/notification/notification_test.go` (new) — 7 tests: dedup same key sent once, dedup different keys sent separately, disabled client no send, missing ntfy topic error, dedup key generation (with incident_id, with approval_id, without entity ID), `CreateNotificationPayload` sets dedup key correctly, ntfy server error returns error.
+
+### Docs staleness (noted, not rewritten in full)
+- `docs/BUILD_PLAN.md`: "Current Focus: M0-02" is stale; uses M0 numbering not in PRD.
+- `docs/MILESTONES.md`: M4 criteria updated to reflect actual implementation status (pairing code generation, command processing implemented; permission response unverified).
+
+## OpenCode Session Lifecycle Fix (Interrupt vs Stop) — 2026-11-02
+
+### Problem (M5/M6 report)
+`OpenCodeAdapter.Stop()` called `serve.Interrupt()` (stops the current turn) and then dropped the session from local tracking. It did NOT terminate the session/process, yet reported STOPPED. This violated PRD §10/§14: Stop should terminate and mark STOPPED only after termination confirmed; Interrupt should stop the turn and retain the session.
+
+### Architectural limitation (honest)
+OpenCode 1.19.0 `opencode serve` runs ONE shared server process across ALL sessions. There is NO per-session termination endpoint — only `POST /session/{id}/interrupt` (stops current turn, session retained) and killing the whole serve process (terminates every session, disrupting unrelated sessions). Therefore `Stop()` **cannot terminate one session independently** without killing the shared server and disrupting other sessions.
+
+### Behavior implemented (safest PRD-consistent)
+- **Interrupt(sessionID):** stops the current turn via `POST /session/{id}/interrupt`, retains the session (WORKING), session can receive follow-up messages. Idempotent-safe.
+- **Stop(sessionID):** drops the session from Argus's local tracking (STOPPED = "no longer managed by Argus"), makes a best-effort interrupt of the current turn, does NOT kill the shared serve process (other sessions unaffected). Idempotent: repeat calls on an already-stopped/unknown session return nil. Does NOT claim the OpenCode process was terminated.
+- **Restore(sessionID):** creates a NEW session for the same project using the most recent task's prompt; marks the original STOPPED. Does NOT claim the original OpenCode process/session was reattached (OpenCode `run` is one-shot, `serve` is unstable).
+- **Close():** kills the shared serve process group and confirms the tracked PID is reaped (no orphaned OpenCode server).
+
+### Tests added
+- `services/agent-manager/internal/adapter/opencode_test.go`:
+  - `TestAdapterInterruptRetainsSession` — interrupt, session still WORKING, follow-up succeeds.
+  - `TestAdapterStopMarksStoppedAndDropsTracking` — stop → STOPPED, not tracked, send fails.
+  - `TestAdapterStopIdempotent` — repeated Stop calls safe.
+  - `TestAdapterStopDoesNotAffectOtherSessions` — stop one, others stay WORKING.
+  - `TestAdapterInterruptUnknownSession` — interrupt unknown session errors.
+  - `TestAdapterStopUnknownSession` — stop unknown session is a no-op (nil).
+- `services/agent-manager/internal/adapter/opencode_integration_test.go` (`//go:build integration`, live OpenCode 1.19.0):
+  - `TestIntegrationInterruptRetainsSession` — live interrupt retains session, follow-up works.
+  - `TestIntegrationStopDropsTracking` — live stop → STOPPED, send fails.
+  - `TestIntegrationStopOtherSessionsUnaffected` — live stop one, other stays WORKING.
+  - `TestIntegrationCloseReapsProcess` — live Close reaps serve PID, no orphan.
+
+### Verification
+- `go test -race -count=1 ./internal/adapter/` — PASS (mock tests)
+- `go test -tags integration -race -count=1 -run 'TestIntegrationInterrupt...|TestIntegrationStop...|TestIntegrationCloseReapsProcess' ./internal/adapter/` — PASS (live tests)
+- Full module `go test -race ./...` — PASS (all packages); `go vet ./...` — PASS; `go build ./...` — PASS; `gofmt` — clean.
+
+### Honest gaps (not disguised as features)
+- `Stop()` cannot confirm termination of one session's OpenCode process (no per-session endpoint). STOPPED means "no longer managed by Argus", not "process confirmed dead". Per-session termination requires one-serve-process-per-session (architecture change, future work).
+- Pre-existing: `TestIntegrationStartSendFollowupStop` `SendMessage` times out (30s) due to OpenCode slow model init; unrelated to lifecycle change.
+
+
+
+## OpenCode Session Lifecycle — DETACHED State — 2026-11-02
+
+### Problem
+The previous lifecycle work marked sessions as `STOPPED` after `Stop()`, but `STOPPED` implies confirmed process termination. OpenCode 1.19.0 `opencode serve` runs one shared server process across all sessions with no per-session termination endpoint, so `Stop()` cannot confirm the underlying OpenCode process exited. Representing a session as `STOPPED` without evidence is dishonest.
+
+### PRD §10 conflict
+PRD §10 lists session states: `STARTING, WORKING, WAITING, PERMISSION_REQUIRED, PAUSED, COMPLETED, ERROR, CRASHED, DISCONNECTED, STOPPED`. There is no `DETACHED` state. Adding `DETACHED` conflicts with this list. Rather than silently rewriting requirements or misusing `STOPPED`, we added `DETACHED` and documented the conflict here. The safest behavior is chosen: do not claim termination without evidence.
+
+### Behavior implemented
+- **`SessionStatusDetached = "DETACHED"`** — added to `internal/state/state.go` and `internal/adapter/adapter.go` (`StatusDetached`).
+- **`Stop(sessionID)`** — marks the session `DETACHED` in the adapter and in SQLite. Keeps the session in the adapter map (not deleted) so `Status()` returns `DETACHED` rather than "not found". Makes a best-effort interrupt of the current turn. Does NOT kill the shared serve process. Idempotent: repeat calls on an already-detached or unknown session return nil.
+- **`Interrupt(sessionID)`** — unchanged: stops the current turn, keeps session `WORKING`, follow-up messages still work. Errors on unknown sessions.
+- **`RestoreSession(sessionID)`** — marks the original session `DETACHED` (not `STOPPED`), then creates a new session for the same project using the most recent task's prompt. Now accepts both `DISCONNECTED` and `DETACHED` as the source state. Does NOT claim the original OpenCode process/session was reattached.
+- **`DELETE /api/sessions/{id}`** — calls `adapter.Stop(id)` then `mgr.DetachSession(id)` to persist `DETACHED` to SQLite. Returns `{"status": "detached"}`.
+- **`Close()`** — kills the shared serve process group, confirms the tracked PID is reaped (no orphaned OpenCode server).
+
+### State transitions
+| Action | Before | After | Evidence |
+|--------|--------|-------|----------|
+| Start | — | WORKING | session created in adapter + SQLite |
+| Interrupt | WORKING | WORKING | current turn stopped, session retained |
+| Stop | WORKING | DETACHED | tracking dropped, best-effort interrupt, process NOT confirmed dead |
+| Restore | DISCONNECTED/DETACHED | new WORKING session | new session created, original marked DETACHED |
+| Close | any | adapter shutdown | serve process group killed, PID reaped |
+
+### UI behavior
+- Desktop: DETACHED shown with gray badge, "Restore" button offered, explanatory text ("Argus stopped tracking this session but cannot confirm the OpenCode process ended. It may still be running."). Stop button disabled.
+- PWA: DETACHED shown with gray badge in SessionList and SessionDetailScreen.
+
+### Tests added
+- `internal/adapter/opencode_test.go`: `TestAdapterStopMarksDetached`, `TestAdapterStopIdempotent`, `TestAdapterStopDoesNotAffectOtherSessions`, `TestAdapterSendMessageToDetachedSession`, `TestAdapterStopUnknownSession`. Existing `TestAdapterStartSendMessageStatusStop` updated to expect DETACHED.
+- `internal/session/manager_test.go`: `TestManagerStopSessionMarksDetached`, `TestManagerStopSessionUnknown`, `TestManagerRestoreSessionMarksOriginalDetached`.
+- `internal/dashboard/dashboard_test.go`: `TestHandleDeleteSessionNoAdapter`.
+
+### Verification
+- `gofmt -l .` — clean
+- `go vet ./...` — clean
+- `go build ./...` — clean
+- `go test -race -count=1 ./...` — PASS (all 10 packages)
+- Desktop `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (8 tests)
+- PWA `tsc --noEmit` — PASS; `npm run build` — PASS; `npx vitest run` — PASS (12 tests)

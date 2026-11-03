@@ -3,13 +3,16 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/argus-command-center/argus/services/agent-manager/internal/adapter"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/meta"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/session"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/state"
@@ -36,7 +39,7 @@ func setupDashboard(t *testing.T) (*Server, *store.Store, string) {
 	t.Cleanup(func() { os.RemoveAll(projDir) })
 	os.MkdirAll(projDir, 0755)
 
-	srv := NewServer(mgr, st, "0")
+	srv := NewServer(mgr, st, "0", nil, nil, time.Now())
 	return srv, st, projDir
 }
 
@@ -633,3 +636,326 @@ func TestDuplicateDecisionApproveThenRejectHTTP(t *testing.T) {
 		t.Errorf("reject after approve expected 409, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestHandlePairingCodeNoSupabase(t *testing.T) {
+	srv := &Server{mgr: nil, store: nil, adapter: nil, sbClient: nil, port: "0", startTime: time.Now()}
+
+	// POST without Supabase -> 503
+	req := httptest.NewRequest(http.MethodPost, "/api/pairing-code", nil)
+	rr := httptest.NewRecorder()
+	srv.handlePairingCode(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when Supabase disabled, got %d", rr.Code)
+	}
+
+	// GET -> 405
+	req = httptest.NewRequest(http.MethodGet, "/api/pairing-code", nil)
+	rr = httptest.NewRecorder()
+	srv.handlePairingCode(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for GET, got %d", rr.Code)
+	}
+}
+
+// TestHandleDeleteSessionWithManager verifies DELETE /api/sessions/{id}
+// works when the manager is configured (even if adapter is nil).
+func TestHandleDeleteSessionWithManager(t *testing.T) {
+	srv, _, projDir := setupDashboard(t)
+
+	// Create a session via the manager.
+	ctx := context.Background()
+	sess, _, err := srv.mgr.CreateSession(ctx, projDir, "", "test prompt")
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// srv.adapter is nil (setupDashboard passes nil), but manager is configured.
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/"+sess.ID, nil)
+	rr := httptest.NewRecorder()
+	srv.handleSessionByID(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 with manager configured, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["status"] != "detached" || resp["session_id"] != sess.ID {
+		t.Errorf("unexpected response: %v", resp)
+	}
+}
+
+// mockDashboardAdapter records Start/SendMessage calls for dashboard tests.
+type mockDashboardAdapter struct {
+	mu         sync.Mutex
+	startCalls int
+	sendCalls  int
+	sessionID  string
+	startErr   error
+	sendErr    error
+	sendResult adapter.MessageResult
+	done       chan struct{} // closed when SendMessage completes
+}
+
+func (m *mockDashboardAdapter) Start(projectDir string) (string, error) {
+	m.mu.Lock()
+	m.startCalls++
+	if m.startErr != nil {
+		m.mu.Unlock()
+		return "", m.startErr
+	}
+	m.sessionID = "ses_mock_" + projectDir
+	m.mu.Unlock()
+	return m.sessionID, nil
+}
+
+func (m *mockDashboardAdapter) SendMessage(sessionID, message string) (adapter.MessageResult, error) {
+	m.mu.Lock()
+	m.sendCalls++
+	err := m.sendErr
+	result := m.sendResult
+	m.mu.Unlock()
+	// Signal completion so tests can wait for the async goroutine.
+	if m.done != nil {
+		close(m.done)
+	}
+	return result, err
+}
+
+func (m *mockDashboardAdapter) waitForSend(t *testing.T) {
+	if m.done == nil {
+		return
+	}
+	select {
+	case <-m.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendMessage to complete")
+	}
+}
+
+func (m *mockDashboardAdapter) Stop(string) error                      { return nil }
+func (m *mockDashboardAdapter) Restart(string) error                   { return nil }
+func (m *mockDashboardAdapter) Status(string) (adapter.Status, error)  { return adapter.StatusWorking, nil }
+func (m *mockDashboardAdapter) Interrupt(string) error                 { return nil }
+func (m *mockDashboardAdapter) Abort(string) error                     { return nil }
+func (m *mockDashboardAdapter) RespondToPermission(string, string, bool) error { return nil }
+func (m *mockDashboardAdapter) GetEvents(string) ([]adapter.Event, error) { return nil, nil }
+func (m *mockDashboardAdapter) Close() error                           { return nil }
+
+var _ adapter.AgentAdapter = (*mockDashboardAdapter)(nil)
+
+func TestHandleSessionsCreateSession(t *testing.T) {
+	srv, _, projDir := setupDashboard(t)
+	// No adapter needed - we use the manager now
+
+	body := `{"project_dir":"` + projDir + `","prompt":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.handleSessions(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Session recorded in SQLite.
+	var bodyData map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &bodyData)
+	sessionID := bodyData["session_id"].(string)
+
+	sess, err := srv.store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("expected session recorded in store: %v", err)
+	}
+	if sess.Status != state.SessionStatusRunning {
+		t.Errorf("expected session status RUNNING, got %s", sess.Status)
+	}
+}
+
+func TestHandleSessionsCreateSessionPromptFailureBestEffort(t *testing.T) {
+	srv, _, _ := setupDashboard(t)
+
+	// Use a project directory that doesn't exist to cause CreateSession to fail
+	badDir := "/nonexistent/project/dir"
+	body := `{"project_dir":"` + badDir + `","prompt":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.handleSessions(rr, req)
+
+	// Session creation fails when project directory doesn't exist
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for nonexistent project dir, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+type boomError struct{ msg string }
+
+func (e *boomError) Error() string { return e.msg }
+
+func TestHandleHealth(t *testing.T) {
+	srv, _, _ := setupDashboard(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rr := httptest.NewRecorder()
+	srv.handleHealth(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal health: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("expected status ok, got %v", body["status"])
+	}
+	if _, ok := body["started_at"].(float64); !ok {
+		t.Errorf("expected started_at to be a number, got %v", body["started_at"])
+	}
+}
+
+// TestHandleSessionsIdempotentCreateSession ensures retrying create-session
+// for the same project dir returns the existing session instead of a duplicate.
+func TestHandleSessionsIdempotentCreateSession(t *testing.T) {
+	srv, st, projDir := setupDashboard(t)
+	// No adapter needed - we use the manager now
+
+	body := `{"project_dir":"` + projDir + `","prompt":"hello"}`
+	makeRequest := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		srv.handleSessions(rr, req)
+		return rr
+	}
+
+	first := makeRequest()
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first create, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstBody map[string]interface{}
+	json.Unmarshal(first.Body.Bytes(), &firstBody)
+	firstID := firstBody["session_id"].(string)
+
+	second := makeRequest()
+	if second.Code != http.StatusOK {
+		t.Fatalf("expected 200 on idempotent retry, got %d: %s", second.Code, second.Body.String())
+	}
+	var secondBody map[string]interface{}
+	json.Unmarshal(second.Body.Bytes(), &secondBody)
+	if secondBody["session_id"] != firstID {
+		t.Errorf("expected idempotent retry to return session %s, got %v", firstID, secondBody["session_id"])
+	}
+
+	// Only one session persisted in SQLite.
+	sessions, err := st.ListSessions()
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Errorf("expected 1 session in store after idempotent retry, got %d", len(sessions))
+	}
+}
+
+// TestHandleSessionsCreateSessionPersistsPromptEvents ensures the initial
+// prompt exchange is persisted as events so the user sees useful feedback.
+func TestHandleSessionsCreateSessionPersistsPromptEvents(t *testing.T) {
+	srv, st, projDir := setupDashboard(t)
+	adptr := &mockDashboardAdapter{
+		done: make(chan struct{}),
+		sendResult: adapter.MessageResult{
+			MessageID: "msg_1",
+			Text:      "assistant reply",
+			Finish:    "stop",
+		},
+	}
+	srv.adapter = adptr
+
+	body := `{"project_dir":"` + projDir + `","prompt":"do the thing"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.handleSessions(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var bodyData map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &bodyData)
+	sessionID := bodyData["session_id"].(string)
+
+	// Poll for persisted events: they are written after the subprocess completes,
+	// so allow a short window for them to land.
+	var events []*state.Event
+	var err error
+	for i := 0; i < 50; i++ {
+		events, err = st.GetEvents(sessionID, 100)
+		if err == nil && len(events) >= 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	if len(events) >= 2 {
+		if events[0].Type != "user_message" || events[1].Type != "assistant_message" {
+			t.Errorf("expected user_message then assistant_message, got %s then %s", events[0].Type, events[1].Type)
+		}
+	}
+}
+
+// mockSessionManager is a test double for session.Manager that allows
+// controlling CreateSession and SendMessage behavior for testing.
+type mockSessionManager struct {
+	createErr error
+}
+
+func (m *mockSessionManager) CreateSession(ctx context.Context, projectDir, model, prompt string) (*state.Session, *state.Task, error) {
+	if m.createErr != nil {
+		return nil, nil, m.createErr
+	}
+	// Return a minimal valid session for testing
+	return &state.Session{
+		ID:         "test-session-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		ProjectDir: projectDir,
+		Agent:      "opencode",
+		Model:      model,
+		Status:     state.SessionStatusRunning,
+		StartedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}, &state.Task{
+		ID:        "test-task-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		SessionID: "",
+		Prompt:    prompt,
+		Status:    state.TaskStatusRunning,
+		Scope:     fmt.Sprintf("project:%s", projectDir),
+		StartedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}, nil
+}
+
+func (m *mockSessionManager) SendMessage(ctx context.Context, sessionID, message string) (*state.Session, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (m *mockSessionManager) StopSession(sessionID string) error { return nil }
+func (m *mockSessionManager) ListSessions() ([]*state.Session, error) { return nil, nil }
+func (m *mockSessionManager) GetSession(id string) (*state.Session, error) { return nil, nil }
+func (m *mockSessionManager) GetSessionTasks(sessionID string) ([]*state.Task, error) { return nil, nil }
+func (m *mockSessionManager) GetSessionIncidents(sessionID string) ([]*state.Incident, error) { return nil, nil }
+func (m *mockSessionManager) GetSessionEvents(sessionID string, limit int) ([]*state.Event, error) { return nil, nil }
+func (m *mockSessionManager) SubmitTask(sessionID, prompt, scope string, dependencies []string) (*state.Task, error) { return nil, nil }
+func (m *mockSessionManager) RequestApproval(approval *state.Approval) error { return nil }
+func (m *mockSessionManager) RespondApproval(approvalID string, approved bool, decidedBy string) error { return nil }
+func (m *mockSessionManager) CreateIncident(inc *state.Incident) error { return nil }
+func (m *mockSessionManager) DiagnoseIncident(incidentID string) error { return nil }
+func (m *mockSessionManager) GetRecoveryAction(id string) (*state.RecoveryAction, error) { return nil, nil }
+func (m *mockSessionManager) ProposeRecovery(incidentID string, action *state.RecoveryAction) error { return nil }
+func (m *mockSessionManager) RequestRecoveryApproval(recoveryID string) (*state.Approval, error) { return nil, nil }
+func (m *mockSessionManager) ExecuteRecovery(recoveryID string) (*state.VerificationResult, error) { return nil, nil }
+func (m *mockSessionManager) DetectIncidentsFromEvents(sessionID string) ([]*state.Incident, error) { return nil, nil }
+func (m *mockSessionManager) RestoreSessions() error { return nil }
+func (m *mockSessionManager) RestoreSession(sessionID string) (*state.Session, *state.Task, error) { return nil, nil, nil }

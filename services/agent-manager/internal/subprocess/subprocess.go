@@ -152,6 +152,88 @@ func (pm *ProcessManager) StartSession(ctx context.Context, sessionID, projectDi
 	return mp, nil
 }
 
+// StartMessageProcess starts a new OpenCode subprocess for a follow-up message.
+// It uses a unique process key to avoid conflicts with existing session processes.
+func (pm *ProcessManager) StartMessageProcess(ctx context.Context, sessionID, projectDir, prompt string) (*ManagedProcess, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// Generate a unique process key to avoid conflicts with the session's main process
+	processKey := sessionID + "-msg-" + fmt.Sprintf("%d", time.Now().UnixNano())
+
+	if _, exists := pm.processes[processKey]; exists {
+		return nil, fmt.Errorf("message process %s already running", processKey)
+	}
+
+	// Validate and normalize project directory
+	absProjectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project directory: %w", err)
+	}
+	info, err := os.Stat(absProjectDir)
+	if err != nil {
+		return nil, fmt.Errorf("project directory not accessible: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("project path is not a directory: %s", absProjectDir)
+	}
+
+	args := []string{"run", "--format", "json", "--dir", absProjectDir}
+	if pm.config.AutoApprove {
+		args = append(args, "--auto")
+	}
+	if pm.config.Model != "" {
+		args = append(args, "--model", pm.config.Model)
+	}
+	args = append(args, prompt)
+
+	// Use a background context that we control
+	procCtx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(procCtx, pm.config.BinaryPath, args...)
+	cmd.Dir = absProjectDir
+	cmd.Env = append(os.Environ(), pm.config.Env...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("start process: %w", err)
+	}
+
+	mp := &ManagedProcess{
+		SessionID:   sessionID,
+		Cmd:         cmd,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		Cancel:      cancel,
+		PID:         cmd.Process.Pid,
+		StartTime:   time.Now(),
+		EventChan:   make(chan *state.Event, 100),
+		ErrorChan:   make(chan error, 10),
+		Done:        make(chan struct{}),
+		store:       pm.store,
+		supabase:    pm.supabase,
+		notifClient: pm.notifClient,
+}
+
+	pm.processes[processKey] = mp
+
+	go mp.readStdout()
+	go mp.readStderr()
+	go mp.wait()
+
+	return mp, nil
+}
+
 // StopSession stops a running session.
 func (pm *ProcessManager) StopSession(sessionID string) error {
 	pm.mu.Lock()

@@ -3,6 +3,7 @@ package supabase
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -231,6 +232,82 @@ func (c *Client) SyncEvent(ctx context.Context, evt *state.Event) error {
 
 	_, _, err := c.client.From("events").Insert(data, false, "", "", "").Execute()
 	return err
+}
+
+// SyncCommand inserts or updates a command in Supabase.
+func (c *Client) SyncCommand(ctx context.Context, cmd *state.Command) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+
+	data := map[string]interface{}{
+		"id":         cmd.ID,
+		"session_id": cmd.SessionID,
+		"type":       cmd.Type,
+		"payload":    cmd.Payload,
+		"status":     cmd.Status,
+		"created_at": cmd.CreatedAt,
+		"updated_at": cmd.UpdatedAt,
+	}
+
+	_, _, err := c.client.From("commands").Upsert(data, "", "", "").Execute()
+	return err
+}
+
+// ListPendingCommands returns all commands with status PENDING.
+func (c *Client) ListPendingCommands(ctx context.Context) ([]*state.Command, error) {
+	if !c.IsEnabled() {
+		return nil, nil
+	}
+
+	var result []map[string]interface{}
+	_, err := c.client.From("commands").
+		Select("*", "", false).
+		Eq("status", "PENDING").
+		ExecuteTo(&result)
+	if err != nil {
+		return nil, fmt.Errorf("list pending commands: %w", err)
+	}
+
+	cmds := make([]*state.Command, 0, len(result))
+	for _, row := range result {
+		cmd := &state.Command{
+			ID:        stringValue(row["id"]),
+			SessionID: stringValue(row["session_id"]),
+			Type:      stringValue(row["type"]),
+			Status:    stringValue(row["status"]),
+		}
+		if payload, ok := row["payload"]; ok {
+			payloadBytes, _ := json.Marshal(payload)
+			cmd.Payload = json.RawMessage(payloadBytes)
+		}
+		if createdAt, ok := row["created_at"]; ok {
+			if t, err := time.Parse(time.RFC3339, stringValue(createdAt)); err == nil {
+				cmd.CreatedAt = t
+			}
+		}
+		if updatedAt, ok := row["updated_at"]; ok {
+			if t, err := time.Parse(time.RFC3339, stringValue(updatedAt)); err == nil {
+				cmd.UpdatedAt = t
+			}
+		}
+		cmds = append(cmds, cmd)
+	}
+	return cmds, nil
+}
+
+// stringValue converts an interface{} from Supabase to a string.
+func stringValue(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case json.RawMessage:
+		return string(val)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // GeneratePairingCode creates a new pairing code for device pairing.

@@ -90,6 +90,7 @@ Or pass the same values as CLI flags to the Go service (useful when running it m
 4. Add RLS policies for each table (see migration file for table names)
 5. Copy the project URL and anon key to your `.env` (or export them)
 
+
 ## OpenCode Installation
 
 ```bash
