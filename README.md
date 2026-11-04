@@ -5,7 +5,7 @@ Argus. Multiple coding agents. One command center.
 
 Argus is a lightweight command center for AI coding agents. Run several agents at once on your own machine, walk away, and stay in control from your phone.
 
-![Home Screen](img/home_screen.png)
+![Home Screen](img/agrus1.png)
 
 ## Why Argus
 
