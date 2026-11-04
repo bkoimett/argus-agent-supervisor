@@ -121,6 +121,44 @@ async function restoreSession(sessionId: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to restore session')
 }
 
+async function fetchMetaConfig(): Promise<{ baseUrl: string; model: string; hasKey: boolean } | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/meta/config`)
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
+  }
+}
+
+async function testMetaConnection(baseUrl: string, apiKey: string, model: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/meta/test-connection`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl, apiKey, model }),
+    })
+    if (!res.ok) return { success: false, error: 'Request failed' }
+    return res.json()
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Connection failed' }
+  }
+}
+
+async function saveMetaConfig(baseUrl: string, apiKey: string, model: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/meta/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl, apiKey, model }),
+    })
+    if (!res.ok) return { success: false, error: 'Request failed' }
+    return res.json()
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Save failed' }
+  }
+}
+
 function statusClass(status: string): string {
   const s = status.toLowerCase()
   switch (s) {
@@ -291,6 +329,24 @@ export default function App() {
   const [selectedSession, setSelectedSession] = useState<DashboardData | null>(null)
   const [createError, setCreateError] = useState<string | null>(null)
   const [createSuccess, setCreateSuccess] = useState<string | null>(null)
+  const [showSettings, setShowSettings] = useState(false)
+  const [metaConfig, setMetaConfig] = useState<{
+    baseUrl: string
+    apiKey: string
+    model: string
+  }>({ baseUrl: '', apiKey: '', model: '' })
+  const [metaConfigError, setMetaConfigError] = useState<string | null>(null)
+  const [metaConfigSuccess, setMetaConfigSuccess] = useState<string | null>(null)
+  const [metaTesting, setMetaTesting] = useState(false)
+
+  // Fetch meta config on mount
+  useEffect(() => {
+    fetchMetaConfig().then((config) => {
+      if (config) {
+        setMetaConfig({ baseUrl: config.baseUrl, apiKey: '', model: config.model })
+      }
+    })
+  }, [])
 
   const liveSessions = useMemo(
     () => (sessions ?? []).filter((s) => sessionKind(s.status) === 'live'),
@@ -397,6 +453,12 @@ export default function App() {
           >
             New Session
           </button>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="px-4 py-2 bg-surfaceHover hover:bg-border border border-border rounded font-medium ml-2"
+          >
+            Settings
+          </button>
         </div>
 
         {/* Error Banner */}
@@ -431,6 +493,7 @@ export default function App() {
                   projectDir={selectedSession.project_dir}
                   agent={selectedSession.agent}
                   status={selectedSession.status}
+                  initialPrompt={selectedSession.tasks?.[0]?.prompt}
                   onStatusChange={(s) => {
                     setSelectedSession((prev) =>
                       prev ? { ...prev, status: s } : null
@@ -484,6 +547,150 @@ export default function App() {
         {/* New Session Modal */}
         {showNewSession && (
           <NewSessionForm onSubmit={handleNewSession} onClose={handleCloseNewSession} serverError={createError} />
+        )}
+
+        {/* Settings Modal */}
+        {showSettings && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-surface border border-border rounded-lg p-6 w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-lg font-medium">Argus Assistant Settings</h2>
+                <button onClick={() => setShowSettings(false)} className="text-textMuted hover:text-text">×</button>
+              </div>
+
+              <div className="space-y-6">
+                {/* Supervision Status */}
+                <div>
+                  <h3 className="text-sm font-medium mb-3">Assistant Supervision</h3>
+                  <p className="text-sm text-textMuted mb-4">
+                    Enable Argus assistant to diagnose incidents and propose recovery actions.
+                    Requires a configured Meta-compatible API (OpenAI, local LLM, etc.).
+                  </p>
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        defaultChecked={true}
+                        className="w-4 h-4 rounded border-border bg-surface text-accent focus:ring-accent"
+                      />
+                      <span className="text-sm">Enable supervision for new sessions (can be toggled per session)</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Model Configuration */}
+                <div className="border-t border-border pt-6">
+                  <h3 className="text-sm font-medium mb-3">Model Configuration</h3>
+                  <p className="text-sm text-textMuted mb-4">
+                    Configure the Meta-compatible API for assistant supervision.
+                    Supports OpenAI API, local LLMs (Ollama, LM Studio), and other OpenAI-compatible endpoints.
+                  </p>
+
+                  {(metaConfigError || metaConfigSuccess) && (
+                    <div className={`p-3 rounded text-sm ${
+                      metaConfigError ? 'bg-red-500/20 border border-red-500/30 text-red-400' :
+                      'bg-green-500/10 border border-green-500/20 text-green-400'
+                    }`}>
+                      {metaConfigError || metaConfigSuccess}
+                    </div>
+                  )}
+
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">API Base URL</label>
+                      <input
+                        type="text"
+                        value={metaConfig.baseUrl}
+                        onChange={(e) => setMetaConfig({ ...metaConfig, baseUrl: e.target.value })}
+                        placeholder="https://api.openai.com/v1 or http://localhost:11434/v1"
+                        className="w-full bg-surface border border-border rounded px-3 py-2 text-text"
+                      />
+                      <p className="text-xs text-textMuted mt-1">
+                        The base URL for the OpenAI-compatible API. Include /v1 suffix if required.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">API Key</label>
+                      <input
+                        type="password"
+                        value={metaConfig.apiKey}
+                        onChange={(e) => setMetaConfig({ ...metaConfig, apiKey: e.target.value })}
+                        placeholder="sk-... or leave blank to use environment variable"
+                        className="w-full bg-surface border border-border rounded px-3 py-2 text-text"
+                      />
+                      <p className="text-xs text-textMuted mt-1">
+                        Your API key. Not stored in the browser after saving. Falls back to META_API_KEY env var.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Model Name</label>
+                      <input
+                        type="text"
+                        value={metaConfig.model}
+                        onChange={(e) => setMetaConfig({ ...metaConfig, model: e.target.value })}
+                        placeholder="gpt-4o-mini, llama3.1, etc."
+                        className="w-full bg-surface border border-border rounded px-3 py-2 text-text"
+                      />
+                      <p className="text-xs text-textMuted mt-1">
+                        The model identifier to use for supervision.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      onClick={async () => {
+                        setMetaTesting(true)
+                        setMetaConfigError(null)
+                        setMetaConfigSuccess(null)
+                        const result = await testMetaConnection(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
+                        setMetaTesting(false)
+                        if (result.success) {
+                          setMetaConfigSuccess('Connection successful!')
+                        } else {
+                          setMetaConfigError(result.error || 'Connection failed')
+                        }
+                      }}
+                      disabled={metaTesting || !metaConfig.baseUrl || !metaConfig.model}
+                      className="flex-1 px-4 py-2 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {metaTesting ? 'Testing...' : 'Test Connection'}
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setMetaConfigError(null)
+                        setMetaConfigSuccess(null)
+                        const result = await saveMetaConfig(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
+                        if (result.success) {
+                          setMetaConfigSuccess('Configuration saved!')
+                        } else {
+                          setMetaConfigError(result.error || 'Save failed')
+                        }
+                      }}
+                      disabled={!metaConfig.baseUrl || !metaConfig.model}
+                      className="flex-1 px-4 py-2 bg-accent hover:bg-accentHover text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+
+                {/* Sync Status */}
+                <div className="border-t border-border pt-6">
+                  <h3 className="text-sm font-medium mb-3">Supabase Sync</h3>
+                  <p className="text-sm text-textMuted mb-2">
+                    Session data syncs to Supabase when configured. Uses service role key on the backend only.
+                  </p>
+                  <div className="p-3 bg-surface/50 border border-border/50 rounded text-sm">
+                    <code>SUPABASE_URL</code> and <code>SUPABASE_SERVICE_KEY</code> must be set in the Go service environment.
+                    The anon key is not used for backend sync operations.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>

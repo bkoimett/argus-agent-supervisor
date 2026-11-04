@@ -102,8 +102,64 @@ func nullTimeIfNotApproved(approved bool, t time.Time) sql.NullTime {
 	return sql.NullTime{Valid: false}
 }
 
-// migrate creates tables if they don't exist.
+// currentSchemaVersion is the latest schema version this code expects.
+const currentSchemaVersion = 3
+
+// migrate creates tables if they don't exist and runs incremental migrations.
 func (s *Store) migrate() error {
+	if err := s.createSchemaVersionTable(); err != nil {
+		return fmt.Errorf("create schema_version table: %w", err)
+	}
+
+	version, err := s.getSchemaVersion()
+	if err != nil {
+		return fmt.Errorf("get schema version: %w", err)
+	}
+
+	if version == 0 {
+		if err := s.runInitialMigration(); err != nil {
+			return fmt.Errorf("initial migration: %w", err)
+		}
+		version = 1
+	}
+
+	for v := version; v < currentSchemaVersion; v++ {
+		if err := s.runMigration(v + 1); err != nil {
+			return fmt.Errorf("migration to version %d: %w", v+1, err)
+		}
+		if err := s.setSchemaVersion(v + 1); err != nil {
+			return fmt.Errorf("set schema version %d: %w", v+1, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) createSchemaVersionTable() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_version (
+			version INTEGER NOT NULL DEFAULT 0,
+			applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	return err
+}
+
+func (s *Store) getSchemaVersion() (int, error) {
+	var version int
+	err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+func (s *Store) setSchemaVersion(version int) error {
+	_, err := s.db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, version)
+	return err
+}
+
+func (s *Store) runInitialMigration() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
@@ -116,7 +172,8 @@ func (s *Store) migrate() error {
 		updated_at DATETIME NOT NULL,
 		ended_at DATETIME,
 		exit_code INTEGER,
-		error_message TEXT
+		error_message TEXT,
+		supervision_enabled BOOLEAN NOT NULL DEFAULT 1
 	);
 
 	CREATE TABLE IF NOT EXISTS tasks (
@@ -147,6 +204,8 @@ func (s *Store) migrate() error {
 		evidence TEXT NOT NULL,
 		meta_diagnosis TEXT,
 		meta_recovery TEXT,
+		meta_source TEXT,
+		meta_model TEXT,
 		detected_at DATETIME NOT NULL,
 		diagnosed_at DATETIME,
 		proposed_at DATETIME,
@@ -207,8 +266,83 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 	CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 	`
-
 	_, err := s.db.Exec(schema)
+	return err
+}
+
+func (s *Store) runMigration(targetVersion int) error {
+	switch targetVersion {
+	case 2:
+		return s.migrationV2()
+	case 3:
+		return s.migrationV3()
+	default:
+		return fmt.Errorf("unknown migration version %d", targetVersion)
+	}
+}
+
+// migrationV2 adds the supervision_enabled column to sessions if missing.
+func (s *Store) migrationV2() error {
+	// Check if column exists
+	rows, err := s.db.Query(`PRAGMA table_info(sessions)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if name == "supervision_enabled" {
+			hasColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasColumn {
+		_, err = s.db.Exec(`ALTER TABLE sessions ADD COLUMN supervision_enabled BOOLEAN NOT NULL DEFAULT 1`)
+	}
+	return err
+}
+
+// migrationV3 adds the scope column to approvals if missing.
+func (s *Store) migrationV3() error {
+	rows, err := s.db.Query(`PRAGMA table_info(approvals)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if name == "scope" {
+			hasColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasColumn {
+		_, err = s.db.Exec(`ALTER TABLE approvals ADD COLUMN scope TEXT NOT NULL DEFAULT ''`)
+	}
 	return err
 }
 
@@ -216,24 +350,24 @@ func (s *Store) migrate() error {
 
 func (s *Store) CreateSession(session *state.Session) error {
 	_, err := s.db.Exec(`
-		INSERT INTO sessions (id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message, supervision_enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, session.ID, session.ProjectDir, session.Agent, session.Model, session.Status, session.PID,
-		session.StartedAt, session.UpdatedAt, session.EndedAt, session.ExitCode, session.ErrorMessage)
+		session.StartedAt, session.UpdatedAt, session.EndedAt, session.ExitCode, session.ErrorMessage, session.SupervisionEnabled)
 	return err
 }
 
 func (s *Store) UpdateSession(session *state.Session) error {
 	session.UpdatedAt = time.Now()
 	_, err := s.db.Exec(`
-		UPDATE sessions SET status=?, pid=?, updated_at=?, ended_at=?, exit_code=?, error_message=? WHERE id=?
-	`, session.Status, session.PID, session.UpdatedAt, session.EndedAt, session.ExitCode, session.ErrorMessage, session.ID)
+		UPDATE sessions SET status=?, pid=?, updated_at=?, ended_at=?, exit_code=?, error_message=?, supervision_enabled=? WHERE id=?
+	`, session.Status, session.PID, session.UpdatedAt, session.EndedAt, session.ExitCode, session.ErrorMessage, session.SupervisionEnabled, session.ID)
 	return err
 }
 
 func (s *Store) GetSession(id string) (*state.Session, error) {
 	row := s.db.QueryRow(`
-		SELECT id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message
+		SELECT id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message, supervision_enabled
 		FROM sessions WHERE id=?
 	`, id)
 
@@ -241,8 +375,9 @@ func (s *Store) GetSession(id string) (*state.Session, error) {
 	var endedAt sql.NullTime
 	var exitCodeInt sql.NullInt64
 	var errMsg sql.NullString
+	var supervisionEnabledStr sql.NullString
 	err := row.Scan(&sess.ID, &sess.ProjectDir, &sess.Agent, &sess.Model, &sess.Status, &sess.PID,
-		&sess.StartedAt, &sess.UpdatedAt, &endedAt, &exitCodeInt, &errMsg)
+		&sess.StartedAt, &sess.UpdatedAt, &endedAt, &exitCodeInt, &errMsg, &supervisionEnabledStr)
 	if err != nil {
 		return nil, err
 	}
@@ -256,12 +391,15 @@ func (s *Store) GetSession(id string) (*state.Session, error) {
 	if errMsg.Valid {
 		sess.ErrorMessage = errMsg.String
 	}
+	if supervisionEnabledStr.Valid {
+		sess.SupervisionEnabled = supervisionEnabledStr.String == "true" || supervisionEnabledStr.String == "1"
+	}
 	return &sess, nil
 }
 
 func (s *Store) ListSessions() ([]*state.Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message
+		SELECT id, project_dir, agent, model, status, pid, started_at, updated_at, ended_at, exit_code, error_message, supervision_enabled
 		FROM sessions ORDER BY started_at DESC
 	`)
 	if err != nil {
@@ -275,8 +413,9 @@ func (s *Store) ListSessions() ([]*state.Session, error) {
 		var endedAt sql.NullTime
 		var exitCodeInt sql.NullInt64
 		var errMsg sql.NullString
+		var supervisionEnabledStr sql.NullString
 		err := rows.Scan(&sess.ID, &sess.ProjectDir, &sess.Agent, &sess.Model, &sess.Status, &sess.PID,
-			&sess.StartedAt, &sess.UpdatedAt, &endedAt, &exitCodeInt, &errMsg)
+			&sess.StartedAt, &sess.UpdatedAt, &endedAt, &exitCodeInt, &errMsg, &supervisionEnabledStr)
 		if err != nil {
 			return nil, err
 		}
@@ -289,6 +428,9 @@ func (s *Store) ListSessions() ([]*state.Session, error) {
 		}
 		if errMsg.Valid {
 			sess.ErrorMessage = errMsg.String
+		}
+		if supervisionEnabledStr.Valid {
+			sess.SupervisionEnabled = supervisionEnabledStr.String == "true" || supervisionEnabledStr.String == "1"
 		}
 		sessions = append(sessions, &sess)
 	}
@@ -405,11 +547,11 @@ func (s *Store) CreateIncident(inc *state.Incident) error {
 	evidence, _ := json.Marshal(inc.Evidence)
 	metaRecovery, _ := json.Marshal(inc.MetaRecovery)
 	_, err := s.db.Exec(`
-		INSERT INTO incidents (id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery,
+		INSERT INTO incidents (id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery, meta_source, meta_model,
 			detected_at, diagnosed_at, proposed_at, approved_at, recovered_at, verified_at, recovery_attempts)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, inc.ID, inc.SessionID, inc.TaskID, inc.Type, inc.Severity, inc.Status,
-		string(evidence), inc.MetaDiagnosis, string(metaRecovery),
+		string(evidence), inc.MetaDiagnosis, string(metaRecovery), inc.MetaSource, inc.MetaModel,
 		inc.DetectedAt, inc.DiagnosedAt, inc.ProposedAt, inc.ApprovedAt, inc.RecoveredAt, inc.VerifiedAt, inc.RecoveryAttempts)
 	return err
 }
@@ -417,25 +559,25 @@ func (s *Store) CreateIncident(inc *state.Incident) error {
 func (s *Store) UpdateIncident(inc *state.Incident) error {
 	metaRecovery, _ := json.Marshal(inc.MetaRecovery)
 	_, err := s.db.Exec(`
-		UPDATE incidents SET status=?, meta_diagnosis=?, meta_recovery=?, diagnosed_at=?, proposed_at=?, approved_at=?, recovered_at=?, verified_at=?, recovery_attempts=?
+		UPDATE incidents SET status=?, meta_diagnosis=?, meta_recovery=?, meta_source=?, meta_model=?, diagnosed_at=?, proposed_at=?, approved_at=?, recovered_at=?, verified_at=?, recovery_attempts=?
 		WHERE id=?
-	`, inc.Status, inc.MetaDiagnosis, string(metaRecovery), inc.DiagnosedAt, inc.ProposedAt, inc.ApprovedAt, inc.RecoveredAt, inc.VerifiedAt, inc.RecoveryAttempts, inc.ID)
+	`, inc.Status, inc.MetaDiagnosis, string(metaRecovery), inc.MetaSource, inc.MetaModel, inc.DiagnosedAt, inc.ProposedAt, inc.ApprovedAt, inc.RecoveredAt, inc.VerifiedAt, inc.RecoveryAttempts, inc.ID)
 	return err
 }
 
 func (s *Store) GetIncident(id string) (*state.Incident, error) {
 	row := s.db.QueryRow(`
-		SELECT id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery,
+		SELECT id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery, meta_source, meta_model,
 			detected_at, diagnosed_at, proposed_at, approved_at, recovered_at, verified_at, recovery_attempts
 		FROM incidents WHERE id=?
 	`, id)
 
 	var inc state.Incident
 	var evidence, metaRecovery string
-	var taskID, metaDiag sql.NullString
+	var taskID, metaDiag, metaSource, metaModel sql.NullString
 	var diagnosedAt, proposedAt, approvedAt, recoveredAt, verifiedAt sql.NullTime
 	err := row.Scan(&inc.ID, &inc.SessionID, &taskID, &inc.Type, &inc.Severity, &inc.Status,
-		&evidence, &metaDiag, &metaRecovery,
+		&evidence, &metaDiag, &metaRecovery, &metaSource, &metaModel,
 		&inc.DetectedAt, &diagnosedAt, &proposedAt, &approvedAt, &recoveredAt, &verifiedAt, &inc.RecoveryAttempts)
 	if err != nil {
 		return nil, err
@@ -446,6 +588,12 @@ func (s *Store) GetIncident(id string) (*state.Incident, error) {
 	}
 	if metaDiag.Valid {
 		inc.MetaDiagnosis = metaDiag.String
+	}
+	if metaSource.Valid {
+		inc.MetaSource = metaSource.String
+	}
+	if metaModel.Valid {
+		inc.MetaModel = metaModel.String
 	}
 	json.Unmarshal([]byte(metaRecovery), &inc.MetaRecovery)
 	if diagnosedAt.Valid {
@@ -468,7 +616,7 @@ func (s *Store) GetIncident(id string) (*state.Incident, error) {
 
 func (s *Store) ListIncidentsBySession(sessionID string) ([]*state.Incident, error) {
 	rows, err := s.db.Query(`
-		SELECT id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery,
+		SELECT id, session_id, task_id, type, severity, status, evidence, meta_diagnosis, meta_recovery, meta_source, meta_model,
 			detected_at, diagnosed_at, proposed_at, approved_at, recovered_at, verified_at, recovery_attempts
 		FROM incidents WHERE session_id=? ORDER BY detected_at DESC
 	`, sessionID)
@@ -481,10 +629,10 @@ func (s *Store) ListIncidentsBySession(sessionID string) ([]*state.Incident, err
 	for rows.Next() {
 		var inc state.Incident
 		var evidence, metaRecovery string
-		var taskID, metaDiag sql.NullString
+		var taskID, metaDiag, metaSource, metaModel sql.NullString
 		var diagnosedAt, proposedAt, approvedAt, recoveredAt, verifiedAt sql.NullTime
 		err := rows.Scan(&inc.ID, &inc.SessionID, &taskID, &inc.Type, &inc.Severity, &inc.Status,
-			&evidence, &metaDiag, &metaRecovery,
+			&evidence, &metaDiag, &metaRecovery, &metaSource, &metaModel,
 			&inc.DetectedAt, &diagnosedAt, &proposedAt, &approvedAt, &recoveredAt, &verifiedAt, &inc.RecoveryAttempts)
 		if err != nil {
 			return nil, err
@@ -495,6 +643,12 @@ func (s *Store) ListIncidentsBySession(sessionID string) ([]*state.Incident, err
 		}
 		if metaDiag.Valid {
 			inc.MetaDiagnosis = metaDiag.String
+		}
+		if metaSource.Valid {
+			inc.MetaSource = metaSource.String
+		}
+		if metaModel.Valid {
+			inc.MetaModel = metaModel.String
 		}
 		json.Unmarshal([]byte(metaRecovery), &inc.MetaRecovery)
 		if diagnosedAt.Valid {

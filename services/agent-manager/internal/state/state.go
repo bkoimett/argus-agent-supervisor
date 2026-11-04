@@ -104,17 +104,18 @@ const (
 
 // Session represents a single agent session.
 type Session struct {
-	ID           string        `json:"id"`
-	ProjectDir   string        `json:"project_dir"`
-	Agent        string        `json:"agent"` // e.g., "opencode"
-	Model        string        `json:"model"` // model identifier
-	Status       SessionStatus `json:"status"`
-	PID          int           `json:"pid,omitempty"`
-	StartedAt    time.Time     `json:"started_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
-	EndedAt      *time.Time    `json:"ended_at,omitempty"`
-	ExitCode     *int          `json:"exit_code,omitempty"`
-	ErrorMessage string        `json:"error_message,omitempty"`
+	ID                 string        `json:"id"`
+	ProjectDir         string        `json:"project_dir"`
+	Agent              string        `json:"agent"` // e.g., "opencode"
+	Model              string        `json:"model"` // model identifier
+	Status             SessionStatus `json:"status"`
+	PID                int           `json:"pid,omitempty"`
+	StartedAt          time.Time     `json:"started_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+	EndedAt            *time.Time    `json:"ended_at,omitempty"`
+	ExitCode           *int          `json:"exit_code,omitempty"`
+	ErrorMessage       string        `json:"error_message,omitempty"`
+	SupervisionEnabled bool          `json:"supervision_enabled"` // whether Argus assistant supervision is enabled for this session
 }
 
 // Task represents a unit of work within a session.
@@ -145,6 +146,8 @@ type Incident struct {
 	Evidence         json.RawMessage  `json:"evidence"` // redacted error output, stack trace
 	MetaDiagnosis    string           `json:"meta_diagnosis,omitempty"`
 	MetaRecovery     json.RawMessage  `json:"meta_recovery,omitempty"` // recovery plan from Meta
+	MetaSource       string           `json:"meta_source,omitempty"`   // "live" or "fallback"
+	MetaModel        string           `json:"meta_model,omitempty"`    // model name when live
 	DetectedAt       time.Time        `json:"detected_at"`
 	DiagnosedAt      *time.Time       `json:"diagnosed_at,omitempty"`
 	ProposedAt       *time.Time       `json:"proposed_at,omitempty"`

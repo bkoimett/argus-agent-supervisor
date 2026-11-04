@@ -13,6 +13,7 @@ interface SessionChatProps {
   projectDir: string
   agent: string
   status: string
+  initialPrompt?: string
   onStatusChange: (status: string) => void
   onClose: () => void
 }
@@ -102,6 +103,7 @@ export default function SessionChat({
   projectDir,
   agent,
   status,
+  initialPrompt,
   onStatusChange,
   onClose,
 }: SessionChatProps) {
@@ -110,6 +112,7 @@ export default function SessionChat({
     text: string
     time: string
     id: string
+    deliveryState?: 'sending' | 'sent' | 'failed'
   }>>([])
   const [activity, setActivity] = useState<Array<{
     type: string
@@ -124,6 +127,10 @@ export default function SessionChat({
   const [completionShown, setCompletionShown] = useState(false)
   const eventsRef = useRef<ChatEvent[]>([])
 
+  // Track if we've seeded the initial prompt from props (for immediate display)
+  const initialPromptSeeded = useRef(false)
+  const initialPromptRef = useRef<string | null>(null)
+
   const refresh = useCallback(async () => {
     const events = await fetchEvents(sessionId)
     // Sort oldest-first as a safety measure regardless of API ordering, so the
@@ -131,17 +138,28 @@ export default function SessionChat({
     events.sort((a, b) => a.timestamp.localeCompare(b.timestamp))
     eventsRef.current = events
 
-    const msgs: Array<{ role: 'user' | 'assistant'; text: string; time: string; id: string }> = []
+    const msgs: Array<{ role: 'user' | 'assistant'; text: string; time: string; id: string; deliveryState?: 'sending' | 'sent' | 'failed' }> = []
     const act: Array<{ type: string; text: string; time: string }> = []
     const errs: Array<{ text: string; time: string }> = []
+
+    // Track which user messages from API match the initial prompt
+    let initialPromptMatched = false
 
     for (const ev of events) {
       const time = formatTime(ev.timestamp)
       const payload = ev.payload || {}
       switch (ev.type) {
-        case 'user_message':
-          msgs.push({ role: 'user', text: String(payload.text || ''), time, id: ev.id })
+        case 'user_message': {
+          const text = String(payload.text || '')
+          // If this matches the initial prompt, use the API event's ID and mark as sent
+          if (initialPromptRef.current && text === initialPromptRef.current) {
+            msgs.push({ role: 'user', text, time, id: ev.id, deliveryState: 'sent' })
+            initialPromptMatched = true
+          } else {
+            msgs.push({ role: 'user', text, time, id: ev.id, deliveryState: 'sent' })
+          }
           break
+        }
         case 'assistant_message':
           msgs.push({
             role: 'assistant',
@@ -171,6 +189,12 @@ export default function SessionChat({
       }
     }
 
+    // If initial prompt was seeded but not matched in API events, keep it
+    if (initialPromptRef.current && !initialPromptMatched) {
+      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      msgs.unshift({ role: 'user', text: initialPromptRef.current, time, id: 'initial-prompt', deliveryState: 'sending' })
+    }
+
     setMessages(msgs)
     setActivity(act)
     setErrors(errs)
@@ -181,6 +205,17 @@ export default function SessionChat({
     const iv = setInterval(refresh, 3000)
     return () => clearInterval(iv)
   }, [refresh])
+
+  // Seed initial prompt from props immediately so user sees it before events load.
+  // Store in ref; refresh() will merge it with API events.
+  useEffect(() => {
+    if (initialPrompt && !initialPromptSeeded.current) {
+      initialPromptSeeded.current = true
+      initialPromptRef.current = initialPrompt
+      // Trigger a refresh to merge the seeded prompt with any existing events
+      refresh()
+    }
+  }, [initialPrompt, refresh])
 
   useEffect(() => {
     // Enable audio on first user interaction so browsers allow playback.
@@ -210,6 +245,9 @@ export default function SessionChat({
     if (!text || sending) return
     setSending(true)
     setSendError(null)
+    // Update status to WORKING immediately so UI reflects active follow-up
+    setSessionStatus('WORKING')
+    onStatusChange('WORKING')
     const res = await sendMessage(sessionId, text)
     setSending(false)
     if (res) {
@@ -218,6 +256,9 @@ export default function SessionChat({
     } else {
       // Preserve the user's text so they can retry without retyping.
       setSendError('Failed to send message. Check your connection and try again.')
+      // Revert status on failure
+      setSessionStatus('COMPLETED')
+      onStatusChange('COMPLETED')
     }
   }
 
@@ -236,6 +277,28 @@ export default function SessionChat({
       setSessionStatus('STOPPED')
       onStatusChange('STOPPED')
       onClose()
+    }
+  }
+
+  const handleGenerateReport = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/report`)
+      if (!res.ok) {
+        throw new Error('Failed to generate report')
+      }
+      const markdown = await res.text()
+      const blob = new Blob([markdown], { type: 'text/markdown' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `session-${sessionId.slice(0, 8)}-report.md`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Failed to generate report:', err)
+      alert('Failed to generate report')
     }
   }
 
@@ -263,6 +326,12 @@ export default function SessionChat({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleGenerateReport}
+            className="px-3 py-1.5 text-sm bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded"
+          >
+            Generate Report
+          </button>
           <button
             onClick={handleInterrupt}
             disabled={sessionStatus === 'STOPPED' || sessionStatus === 'ERROR' || sessionStatus === 'DETACHED'}
@@ -312,7 +381,18 @@ export default function SessionChat({
                 <div className="bg-blue-500/20 text-blue-400 p-3 rounded-lg rounded-tr-none rounded-br-none text-sm break-words">
                   {m.text}
                 </div>
-                <div className="font-mono text-[10px] text-textMuted text-right">{m.time}</div>
+                <div className="flex items-center justify-end gap-1 font-mono text-[10px] text-textMuted">
+                  {m.time}
+                  {m.deliveryState === 'sending' && (
+                    <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded text-[9px]">Sending…</span>
+                  )}
+                  {m.deliveryState === 'failed' && (
+                    <span className="px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded text-[9px]">Failed</span>
+                  )}
+                  {m.deliveryState === 'sent' && m.id !== 'initial-prompt' && (
+                    <span className="px-1.5 py-0.5 bg-green-500/20 text-green-400 rounded text-[9px]">Sent</span>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="flex flex-col gap-1">

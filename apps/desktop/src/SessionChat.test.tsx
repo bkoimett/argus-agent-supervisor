@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import SessionChat from './SessionChat'
 
 // Mock fetch globally
@@ -244,5 +244,38 @@ describe('SessionChat', () => {
       expect(screen.getByText('Tool activity & events')).toBeInTheDocument()
     })
     expect(screen.getByText('1')).toBeInTheDocument() // activity count
+  })
+
+  it('displays initial prompt from props immediately with Sending state', async () => {
+    mockEventsResponse([])
+    await act(async () => {
+      render(<SessionChat {...defaultProps} initialPrompt="echo argus" />)
+    })
+
+    // Initial prompt should appear immediately
+    expect(screen.getByText('echo argus')).toBeInTheDocument()
+    // Should show Sending... badge
+    expect(screen.getByText('Sending…')).toBeInTheDocument()
+  })
+
+  it('updates initial prompt delivery state to Sent when events are fetched', async () => {
+    const events = [
+      {
+        id: 'evt_1',
+        session_id: 'ses_test_123',
+        type: 'user_message',
+        timestamp: Date.now().toString(),
+        payload: { text: 'echo argus' },
+      },
+    ]
+    mockEventsResponse(events)
+
+    await act(async () => {
+      render(<SessionChat {...defaultProps} initialPrompt="echo argus" />)
+    })
+
+    // When API returns the user_message event, it should show Sent immediately
+    expect(screen.getByText('Sent')).toBeInTheDocument()
+    expect(screen.queryByText('Sending…')).not.toBeInTheDocument()
   })
 })

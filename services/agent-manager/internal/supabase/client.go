@@ -23,9 +23,10 @@ type Config struct {
 
 // Client wraps the Supabase client with Argus-specific operations.
 type Client struct {
-	client *supabase.Client
-	config Config
-	mu     sync.RWMutex
+	client        *supabase.Client
+	serviceClient *supabase.Client
+	config        Config
+	mu            sync.RWMutex
 
 	// Realtime subscriptions
 	sessionChannels map[string]chan *state.Session
@@ -49,13 +50,24 @@ func NewClient(config Config) (*Client, error) {
 		return nil, fmt.Errorf("Supabase URL and anon key required when enabled")
 	}
 
-	client, err := supabase.NewClient(config.URL, config.AnonKey, &supabase.ClientOptions{})
+	// Create client with anon key for realtime subscriptions (PWA needs this)
+	anonClient, err := supabase.NewClient(config.URL, config.AnonKey, &supabase.ClientOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Supabase client: %w", err)
+		return nil, fmt.Errorf("failed to create Supabase anon client: %w", err)
+	}
+
+	// Create client with service key for backend write operations (if available)
+	var serviceClient *supabase.Client
+	if config.ServiceKey != "" {
+		serviceClient, err = supabase.NewClient(config.URL, config.ServiceKey, &supabase.ClientOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Supabase service client: %w", err)
+		}
 	}
 
 	c := &Client{
-		client:          client,
+		client:          anonClient,
+		serviceClient:   serviceClient,
 		config:          config,
 		sessionChannels: make(map[string]chan *state.Session),
 		cmdChannels:     make(map[string]chan *state.Command),
@@ -68,6 +80,14 @@ func NewClient(config Config) (*Client, error) {
 // IsEnabled returns whether Supabase integration is enabled.
 func (c *Client) IsEnabled() bool {
 	return c.config.Enabled
+}
+
+// writeClient returns the client to use for write operations (service role if available).
+func (c *Client) writeClient() *supabase.Client {
+	if c.serviceClient != nil {
+		return c.serviceClient
+	}
+	return c.client
 }
 
 // SyncSession syncs a session to Supabase.
@@ -89,7 +109,7 @@ func (c *Client) SyncSession(ctx context.Context, sess *state.Session) error {
 		"updated_at":    time.Now(),
 	}
 
-	_, _, err := c.client.From("sessions").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("sessions").Upsert(data, "", "", "").Execute()
 	if err != nil {
 		return fmt.Errorf("failed to sync session: %w", err)
 	}
@@ -129,7 +149,7 @@ func (c *Client) SyncTask(ctx context.Context, task *state.Task) error {
 		"updated_at":     time.Now(),
 	}
 
-	_, _, err := c.client.From("tasks").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("tasks").Upsert(data, "", "", "").Execute()
 	return err
 }
 
@@ -159,7 +179,7 @@ func (c *Client) SyncIncident(ctx context.Context, inc *state.Incident) error {
 		"updated_at":        time.Now(),
 	}
 
-	_, _, err := c.client.From("incidents").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("incidents").Upsert(data, "", "", "").Execute()
 	return err
 }
 
@@ -188,7 +208,7 @@ func (c *Client) SyncApproval(ctx context.Context, appr *state.Approval) error {
 		"updated_at":   time.Now(),
 	}
 
-	_, _, err := c.client.From("approvals").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("approvals").Upsert(data, "", "", "").Execute()
 	return err
 }
 
@@ -213,7 +233,7 @@ func (c *Client) SyncRecoveryAction(ctx context.Context, ra *state.RecoveryActio
 		"updated_at":  time.Now(),
 	}
 
-	_, _, err := c.client.From("recovery_actions").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("recovery_actions").Upsert(data, "", "", "").Execute()
 	return err
 }
 
@@ -230,7 +250,7 @@ func (c *Client) SyncEvent(ctx context.Context, evt *state.Event) error {
 		"created_at": evt.Timestamp,
 	}
 
-	_, _, err := c.client.From("events").Insert(data, false, "", "", "").Execute()
+	_, _, err := c.writeClient().From("events").Insert(data, false, "", "", "").Execute()
 	return err
 }
 
@@ -250,7 +270,7 @@ func (c *Client) SyncCommand(ctx context.Context, cmd *state.Command) error {
 		"updated_at": cmd.UpdatedAt,
 	}
 
-	_, _, err := c.client.From("commands").Upsert(data, "", "", "").Execute()
+	_, _, err := c.writeClient().From("commands").Upsert(data, "", "", "").Execute()
 	return err
 }
 
@@ -261,7 +281,7 @@ func (c *Client) ListPendingCommands(ctx context.Context) ([]*state.Command, err
 	}
 
 	var result []map[string]interface{}
-	_, err := c.client.From("commands").
+	_, err := c.writeClient().From("commands").
 		Select("*", "", false).
 		Eq("status", "PENDING").
 		ExecuteTo(&result)
@@ -326,7 +346,7 @@ func (c *Client) GeneratePairingCode(ctx context.Context, userID string) (string
 		"created_at": time.Now(),
 	}
 
-	_, _, err := c.client.From("pairing_codes").Insert(data, false, "", "", "").Execute()
+	_, _, err := c.writeClient().From("pairing_codes").Insert(data, false, "", "", "").Execute()
 	if err != nil {
 		return "", fmt.Errorf("failed to create pairing code: %w", err)
 	}
@@ -341,7 +361,7 @@ func (c *Client) ValidatePairingCode(ctx context.Context, code string) (string, 
 	}
 
 	var result []map[string]interface{}
-	_, err := c.client.From("pairing_codes").
+	_, err := c.writeClient().From("pairing_codes").
 		Select("user_id, expires_at", "", false).
 		Eq("code", code).
 		Gt("expires_at", time.Now().Format(time.RFC3339)).
@@ -353,7 +373,7 @@ func (c *Client) ValidatePairingCode(ctx context.Context, code string) (string, 
 	userID := result[0]["user_id"].(string)
 
 	// Delete the used code
-	_, _, _ = c.client.From("pairing_codes").Delete("", "").Eq("code", code).Execute()
+	_, _, _ = c.writeClient().From("pairing_codes").Delete("", "").Eq("code", code).Execute()
 
 	return userID, nil
 }

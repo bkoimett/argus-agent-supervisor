@@ -127,6 +127,7 @@ func (pm *ProcessManager) StartSession(ctx context.Context, sessionID, projectDi
 		return nil, fmt.Errorf("start process: %w", err)
 	}
 
+	// Create the ManagedProcess struct first so we can use its channels for early failure detection
 	mp := &ManagedProcess{
 		SessionID:   sessionID,
 		Cmd:         cmd,
@@ -141,6 +142,28 @@ func (pm *ProcessManager) StartSession(ctx context.Context, sessionID, projectDi
 		store:       pm.store,
 		supabase:    pm.supabase,
 		notifClient: pm.notifClient,
+	}
+
+	// Early failure detection: wait briefly to catch immediate process failures
+	// (e.g., binary not found, permission denied, invalid args).
+	// If the process exits within this window, capture the error synchronously.
+	select {
+	case <-time.After(500 * time.Millisecond):
+		// Process is still running after 500ms, assume it started successfully
+	case <-mp.Done:
+		// Process exited quickly - check for error
+		select {
+		case err := <-mp.ErrorChan:
+			if err != nil {
+				delete(pm.processes, sessionID)
+				cancel()
+				return nil, fmt.Errorf("opencode process exited early: %w", err)
+			}
+		default:
+			delete(pm.processes, sessionID)
+			cancel()
+			return nil, fmt.Errorf("opencode process exited early without error")
+		}
 	}
 
 	pm.processes[sessionID] = mp
@@ -209,6 +232,7 @@ func (pm *ProcessManager) StartMessageProcess(ctx context.Context, sessionID, pr
 		return nil, fmt.Errorf("start process: %w", err)
 	}
 
+	// Create the ManagedProcess struct first so we can use its channels for early failure detection
 	mp := &ManagedProcess{
 		SessionID:   sessionID,
 		Cmd:         cmd,
@@ -223,7 +247,29 @@ func (pm *ProcessManager) StartMessageProcess(ctx context.Context, sessionID, pr
 		store:       pm.store,
 		supabase:    pm.supabase,
 		notifClient: pm.notifClient,
-}
+	}
+
+	// Early failure detection: wait briefly to catch immediate process failures
+	// (e.g., binary not found, permission denied, invalid args).
+	// If the process exits within this window, capture the error synchronously.
+	select {
+	case <-time.After(500 * time.Millisecond):
+		// Process is still running after 500ms, assume it started successfully
+	case <-mp.Done:
+		// Process exited quickly - check for error
+		select {
+		case err := <-mp.ErrorChan:
+			if err != nil {
+				delete(pm.processes, processKey)
+				cancel()
+				return nil, fmt.Errorf("opencode process exited early: %w", err)
+			}
+		default:
+			delete(pm.processes, processKey)
+			cancel()
+			return nil, fmt.Errorf("opencode process exited early without error")
+		}
+	}
 
 	pm.processes[processKey] = mp
 
@@ -380,30 +426,56 @@ func (mp *ManagedProcess) wait() {
 
 // convertEvent converts OpenCode event to internal event.
 func (mp *ManagedProcess) convertEvent(ocEvent *state.OpenCodeEvent) *state.Event {
-	event := &state.Event{
-		SessionID: mp.SessionID,
-		Type:      ocEvent.Type,
-		Timestamp: time.UnixMilli(ocEvent.Timestamp),
-		Payload:   ocEvent.Part,
-	}
-
 	// Map OpenCode event types to internal types
 	switch ocEvent.Type {
 	case "step_start":
-		event.Type = "step_start"
+		return &state.Event{
+			SessionID: mp.SessionID,
+			Type:      "step_start",
+			Timestamp: time.UnixMilli(ocEvent.Timestamp),
+			Payload:   ocEvent.Part,
+		}
 	case "tool_use":
-		event.Type = "tool_use"
+		event := &state.Event{
+			SessionID: mp.SessionID,
+			Type:      "tool_use",
+			Timestamp: time.UnixMilli(ocEvent.Timestamp),
+			Payload:   ocEvent.Part,
+		}
 		// Normalize tool_use events to have consistent fields
 		event.Payload = normalizeToolUseEvent(ocEvent.Part)
+		return event
 	case "step_finish":
-		event.Type = "step_finish"
+		return &state.Event{
+			SessionID: mp.SessionID,
+			Type:      "step_finish",
+			Timestamp: time.UnixMilli(ocEvent.Timestamp),
+			Payload:   ocEvent.Part,
+		}
 	case "text":
-		event.Type = "text"
+		// Convert OpenCode "text" events to "assistant_message" for UI rendering
+		// OpenCode text event Part typically contains: {"text": "assistant response", "sessionID": "..."}
+		textContent := ""
+		if part, ok := ocEvent.Part["text"].(string); ok {
+			textContent = part
+		}
+		return &state.Event{
+			SessionID: mp.SessionID,
+			Type:      "assistant_message",
+			Timestamp: time.UnixMilli(ocEvent.Timestamp),
+			Payload: map[string]interface{}{
+				"text":      textContent,
+				"messageID": ocEvent.Part["messageID"],
+			},
+		}
 	default:
-		event.Type = "unknown"
+		return &state.Event{
+			SessionID: mp.SessionID,
+			Type:      "unknown",
+			Timestamp: time.UnixMilli(ocEvent.Timestamp),
+			Payload:   ocEvent.Part,
+		}
 	}
-
-	return event
 }
 
 // normalizeToolUseEvent extracts and normalizes tool execution data from OpenCode tool_use events.

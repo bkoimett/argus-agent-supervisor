@@ -61,8 +61,8 @@ func main() {
 		model              = flag.String("model", envStr("OPENCODE_MODEL", ""), "Default model (provider/model)")
 		autoApprove        = flag.Bool("auto", envBool("OPENCODE_AUTO_APPROVE", false), "Auto-approve permissions (DANGEROUS)")
 		metaAPIKey         = flag.String("meta-api-key", envStr("META_API_KEY", ""), "Meta API key (enables Meta diagnosis)")
-		metaBaseURL        = flag.String("meta-base-url", envStr("META_BASE_URL", "https://api.meta.example.com/v1"), "Meta API base URL")
-		metaModel          = flag.String("meta-model", envStr("META_MODEL", "meta-llama-3-70b"), "Meta model to use")
+		metaBaseURL        = flag.String("meta-base-url", envStr("META_BASE_URL", ""), "Meta API base URL")
+		metaModel          = flag.String("meta-model", envStr("META_MODEL", ""), "Meta model to use")
 		supabaseURL        = flag.String("supabase-url", envStr("SUPABASE_URL", ""), "Supabase project URL")
 		supabaseKey        = flag.String("supabase-key", envStr("SUPABASE_ANON_KEY", ""), "Supabase anon key")
 		supabaseSvc        = flag.String("supabase-service-key", envStr("SUPABASE_SERVICE_KEY", ""), "Supabase service key")
@@ -126,11 +126,19 @@ func main() {
 		APIKey:  *metaAPIKey,
 		BaseURL: *metaBaseURL,
 		Model:   *metaModel,
-		Enabled: *metaAPIKey != "",
 	}
-
-	// Initialize session manager
 	mgr := session.NewManager(st, procMgr, metaConfig, sbClient, notifClient)
+
+	// Log Meta diagnosis mode
+	if metaConfig.APIKey != "" && metaConfig.BaseURL != "" {
+		modelName := metaConfig.Model
+		if modelName == "" {
+			modelName = "default"
+		}
+		log.Printf("Meta diagnosis: live (model %s)", modelName)
+	} else {
+		log.Printf("Meta diagnosis: fallback (not configured)")
+	}
 
 	// Restore sessions that were running when the service stopped.
 	// OpenCode processes are not children of the GUI and do not survive

@@ -67,6 +67,11 @@ func NewManager(st *store.Store, procMgr *subprocess.ProcessManager, metaConfig 
 	return m
 }
 
+// GetMetaClient returns the Meta client for testing connection.
+func (m *Manager) GetMetaClient() *meta.Client {
+	return m.metaClient
+}
+
 // CreateSession creates a new session and starts the OpenCode process.
 func (m *Manager) CreateSession(ctx context.Context, projectDir, model, prompt string) (*state.Session, *state.Task, error) {
 	// Validate and normalize project directory
@@ -86,13 +91,14 @@ func (m *Manager) CreateSession(ctx context.Context, projectDir, model, prompt s
 	taskID := uuid.New().String()
 
 	session := &state.Session{
-		ID:         sessionID,
-		ProjectDir: absProjectDir,
-		Agent:      "opencode",
-		Model:      model,
-		Status:     state.SessionStatusStarting,
-		StartedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:                 sessionID,
+		ProjectDir:         absProjectDir,
+		Agent:              "opencode",
+		Model:              model,
+		Status:             state.SessionStatusStarting,
+		StartedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+		SupervisionEnabled: true, // default to enabled; can be disabled via API
 	}
 
 	task := &state.Task{
@@ -131,6 +137,23 @@ func (m *Manager) CreateSession(ctx context.Context, projectDir, model, prompt s
 	m.store.UpdateSession(session)
 	m.syncSession(session)
 
+	// Persist the initial user prompt as a user_message event so it appears in the conversation immediately.
+	userMsgEvent := &state.Event{
+		SessionID: sessionID,
+		Type:      "user_message",
+		Timestamp: time.Now(),
+		Payload:   map[string]any{"text": prompt},
+	}
+	if err := m.store.AppendEvent(userMsgEvent); err != nil {
+		// Log but don't fail session creation
+		fmt.Printf("failed to append user_message event: %v\n", err)
+	} else if m.supabase != nil && m.supabase.IsEnabled() {
+		ctx := context.Background()
+		if err := m.supabase.SyncEvent(ctx, userMsgEvent); err != nil {
+			fmt.Printf("Supabase sync user_message error: %v\n", err)
+		}
+	}
+
 	task.Status = state.TaskStatusRunning
 	m.store.UpdateTask(task)
 	m.syncTask(task)
@@ -141,6 +164,21 @@ func (m *Manager) CreateSession(ctx context.Context, projectDir, model, prompt s
 // GetSession returns a session by ID.
 func (m *Manager) GetSession(id string) (*state.Session, error) {
 	return m.store.GetSession(id)
+}
+
+// SetSupervision enables or disables Argus assistant supervision for a session.
+func (m *Manager) SetSupervision(sessionID string, enabled bool) error {
+	sess, err := m.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("session %s not found: %w", sessionID, err)
+	}
+	sess.SupervisionEnabled = enabled
+	sess.UpdatedAt = time.Now()
+	if err := m.store.UpdateSession(sess); err != nil {
+		return fmt.Errorf("update session %s: %w", sessionID, err)
+	}
+	m.syncSession(sess)
+	return nil
 }
 
 // ListSessions returns all sessions.
@@ -233,9 +271,49 @@ func (m *Manager) SendMessage(ctx context.Context, sessionID, message string) (*
 		return nil, err
 	}
 
+	// Update session status to RUNNING so UI reflects active work
+	session.Status = state.SessionStatusRunning
+	session.UpdatedAt = time.Now()
+	if err := m.store.UpdateSession(session); err != nil {
+		return nil, fmt.Errorf("update session status: %w", err)
+	}
+	m.syncSession(session)
+
+	// Persist the user message immediately so it appears in the conversation.
+	// This gives honest feedback even if the subprocess fails.
+	userMsgEvent := &state.Event{
+		SessionID: sessionID,
+		Type:      "user_message",
+		Timestamp: time.Now(),
+		Payload:   map[string]any{"text": message},
+	}
+	if err := m.store.AppendEvent(userMsgEvent); err != nil {
+		return nil, fmt.Errorf("append user_message event: %w", err)
+	}
+	if m.supabase != nil && m.supabase.IsEnabled() {
+		if err := m.supabase.SyncEvent(ctx, userMsgEvent); err != nil {
+			fmt.Printf("Supabase sync user_message error: %v\n", err)
+		}
+	}
+
 	// Start a subprocess for the follow-up message
 	mp, err := m.procMgr.StartMessageProcess(ctx, sessionID, session.ProjectDir, message)
 	if err != nil {
+		// Mark the user message as failed by appending an error event
+		errEvent := &state.Event{
+			SessionID: sessionID,
+			Type:      "error",
+			Timestamp: time.Now(),
+			Payload:   map[string]any{"error": fmt.Sprintf("Failed to start agent process: %v", err)},
+		}
+		_ = m.store.AppendEvent(errEvent)
+		if m.supabase != nil && m.supabase.IsEnabled() {
+			_ = m.supabase.SyncEvent(ctx, errEvent)
+		}
+		// Revert session status on failure
+		session.Status = state.SessionStatusCompleted
+		m.store.UpdateSession(session)
+		m.syncSession(session)
 		return nil, err
 	}
 
@@ -403,6 +481,15 @@ func (m *Manager) DiagnoseIncident(incidentID string) error {
 		return err
 	}
 
+	// Check if supervision is enabled for this session
+	session, err := m.store.GetSession(inc.SessionID)
+	if err != nil {
+		return err
+	}
+	if !session.SupervisionEnabled {
+		return fmt.Errorf("supervision is disabled for this session")
+	}
+
 	// Update status to diagnosing
 	inc.Status = state.IncidentStatusDiagnosing
 	now := time.Now()
@@ -438,6 +525,8 @@ func (m *Manager) DiagnoseIncident(incidentID string) error {
 
 	// Store diagnosis
 	inc.MetaDiagnosis = resp.Diagnosis
+	inc.MetaSource = resp.Source
+	inc.MetaModel = resp.ModelVersion
 	recoveryPlanBytes, _ := json.Marshal(resp.RecoveryPlan)
 	inc.MetaRecovery = recoveryPlanBytes
 	inc.Status = state.IncidentStatusProposed
@@ -686,38 +775,7 @@ func (m *Manager) ExecuteRecovery(recoveryID string) (*state.VerificationResult,
 // verifyCommandIntegrity validates a recovery command before execution.
 // Commands are invoked directly, never through a shell.
 func (m *Manager) verifyCommandIntegrity(command string, args []string) bool {
-	switch command {
-	case "echo":
-		// Echo is used for harmless demo/fallback actions. Bound its input.
-		if len(args) > 16 {
-			return false
-		}
-		for _, arg := range args {
-			if len(arg) > 256 {
-				return false
-			}
-		}
-		return true
-
-	case "go":
-		// Permit only fixed, non-interactive verification commands.
-		switch {
-		case len(args) == 2 && args[0] == "test" && args[1] == "./...":
-			return true
-		case len(args) == 2 && args[0] == "build" && args[1] == "./...":
-			return true
-		case len(args) == 2 && args[0] == "vet" && args[1] == "./...":
-			return true
-		case len(args) == 2 && args[0] == "mod" && args[1] == "verify":
-			return true
-		case len(args) == 2 && args[0] == "mod" && args[1] == "tidy":
-			return true
-		default:
-			return false
-		}
-	default:
-		return false
-	}
+	return meta.IsAllowedCommand(command, args)
 }
 
 // SubscribeEvents subscribes to session events.
@@ -1382,6 +1440,180 @@ func (m *Manager) sendIncidentNotification(inc *state.Incident, notifType notifi
 	})
 
 	_ = m.notifClient.Send(nil, payload)
+}
+
+// GenerateReport creates a markdown report for a session.
+func (m *Manager) GenerateReport(sessionID string) (string, error) {
+	session, err := m.store.GetSession(sessionID)
+	if err != nil {
+		return "", fmt.Errorf("session not found: %w", err)
+	}
+
+	tasks, _ := m.store.ListTasksBySession(sessionID)
+	incidents, _ := m.store.ListIncidentsBySession(sessionID)
+	events, _ := m.store.GetEvents(sessionID, 500)
+
+	var approvals []*state.Approval
+	if allApprovals, err := m.store.ListPendingApprovals(); err == nil {
+		for _, a := range allApprovals {
+			if a.SessionID == sessionID {
+				approvals = append(approvals, a)
+			}
+		}
+	}
+
+	var recoveryActions []*state.RecoveryAction
+	if allRecovery, err := m.store.ListRecoveryActions(""); err == nil {
+		for _, ra := range allRecovery {
+			for _, inc := range incidents {
+				if ra.IncidentID == inc.ID {
+					recoveryActions = append(recoveryActions, ra)
+					break
+				}
+			}
+		}
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("# Session Report: %s\n\n", session.ID[:8]))
+	sb.WriteString(fmt.Sprintf("**Project:** %s  \n", session.ProjectDir))
+	sb.WriteString(fmt.Sprintf("**Agent:** %s  \n", session.Agent))
+	sb.WriteString(fmt.Sprintf("**Model:** %s  \n", session.Model))
+	sb.WriteString(fmt.Sprintf("**Status:** %s  \n", session.Status))
+	sb.WriteString(fmt.Sprintf("**Started:** %s  \n", session.StartedAt.Format(time.RFC3339)))
+	if session.EndedAt != nil {
+		sb.WriteString(fmt.Sprintf("**Ended:** %s  \n", session.EndedAt.Format(time.RFC3339)))
+	}
+	if session.ExitCode != nil {
+		sb.WriteString(fmt.Sprintf("**Exit Code:** %d  \n", *session.ExitCode))
+	}
+	if session.ErrorMessage != "" {
+		sb.WriteString(fmt.Sprintf("**Error:** %s  \n", session.ErrorMessage))
+	}
+	sb.WriteString(fmt.Sprintf("**Supervision:** %s  \n\n", map[bool]string{true: "Enabled", false: "Disabled"}[session.SupervisionEnabled]))
+
+	if len(tasks) > 0 {
+		sb.WriteString("## Tasks\n\n")
+		for _, t := range tasks {
+			sb.WriteString(fmt.Sprintf("### Task %s\n\n", t.ID[:8]))
+			sb.WriteString(fmt.Sprintf("**Prompt:** %s  \n", t.Prompt))
+			sb.WriteString(fmt.Sprintf("**Status:** %s  \n", t.Status))
+			sb.WriteString(fmt.Sprintf("**Scope:** %s  \n", t.Scope))
+			sb.WriteString(fmt.Sprintf("**Started:** %s  \n", t.StartedAt.Format(time.RFC3339)))
+			if t.EndedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Ended:** %s  \n", t.EndedAt.Format(time.RFC3339)))
+			}
+			if t.ExitCode != nil {
+				sb.WriteString(fmt.Sprintf("**Exit Code:** %d  \n", *t.ExitCode))
+			}
+			if t.ErrorMessage != "" {
+				sb.WriteString(fmt.Sprintf("**Error:** %s  \n", t.ErrorMessage))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(incidents) > 0 {
+		sb.WriteString("## Incidents\n\n")
+		for _, inc := range incidents {
+			sb.WriteString(fmt.Sprintf("### Incident %s\n\n", inc.ID[:8]))
+			sb.WriteString(fmt.Sprintf("**Type:** %s  \n", inc.Type))
+			sb.WriteString(fmt.Sprintf("**Severity:** %s  \n", inc.Severity))
+			sb.WriteString(fmt.Sprintf("**Status:** %s  \n", inc.Status))
+			sb.WriteString(fmt.Sprintf("**Detected:** %s  \n", inc.DetectedAt.Format(time.RFC3339)))
+			if inc.DiagnosedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Diagnosed:** %s  \n", inc.DiagnosedAt.Format(time.RFC3339)))
+			}
+			if inc.ProposedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Proposed:** %s  \n", inc.ProposedAt.Format(time.RFC3339)))
+			}
+			if inc.ApprovedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Approved:** %s  \n", inc.ApprovedAt.Format(time.RFC3339)))
+			}
+			if inc.RecoveredAt != nil {
+				sb.WriteString(fmt.Sprintf("**Recovered:** %s  \n", inc.RecoveredAt.Format(time.RFC3339)))
+			}
+			if inc.VerifiedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Verified:** %s  \n", inc.VerifiedAt.Format(time.RFC3339)))
+			}
+			if inc.MetaDiagnosis != "" {
+				sb.WriteString(fmt.Sprintf("**Diagnosis:** %s  \n", inc.MetaDiagnosis))
+			}
+			if inc.MetaSource != "" {
+				sb.WriteString(fmt.Sprintf("**Source:** %s  \n", inc.MetaSource))
+			}
+			if inc.MetaModel != "" {
+				sb.WriteString(fmt.Sprintf("**Model:** %s  \n", inc.MetaModel))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(recoveryActions) > 0 {
+		sb.WriteString("## Recovery Actions\n\n")
+		for _, ra := range recoveryActions {
+			sb.WriteString(fmt.Sprintf("### Recovery %s\n\n", ra.ID[:8]))
+			sb.WriteString(fmt.Sprintf("**Type:** %s  \n", ra.Type))
+			sb.WriteString(fmt.Sprintf("**Description:** %s  \n", ra.Description))
+			sb.WriteString(fmt.Sprintf("**Command:** `%s %s`  \n", ra.Command, strings.Join(ra.Args, " ")))
+			sb.WriteString(fmt.Sprintf("**Status:** %s  \n", ra.Status))
+			sb.WriteString(fmt.Sprintf("**Proposed:** %s  \n", ra.ProposedAt.Format(time.RFC3339)))
+			if ra.ApprovedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Approved:** %s  \n", ra.ApprovedAt.Format(time.RFC3339)))
+			}
+			if ra.ExecutedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Executed:** %s  \n", ra.ExecutedAt.Format(time.RFC3339)))
+			}
+			if ra.Result != nil {
+				sb.WriteString(fmt.Sprintf("**Verification:** %s  \n", ra.Result.Status))
+				sb.WriteString(fmt.Sprintf("**Exit Code:** %d  \n", ra.Result.ExitCode))
+				if ra.Result.Stdout != "" {
+					sb.WriteString(fmt.Sprintf("**Stdout:**\n```\n%s\n```\n", ra.Result.Stdout))
+				}
+				if ra.Result.Stderr != "" {
+					sb.WriteString(fmt.Sprintf("**Stderr:**\n```\n%s\n```\n", ra.Result.Stderr))
+				}
+				sb.WriteString(fmt.Sprintf("**Integrity OK:** %v  \n", ra.Result.IntegrityOK))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(approvals) > 0 {
+		sb.WriteString("## Approvals\n\n")
+		for _, a := range approvals {
+			sb.WriteString(fmt.Sprintf("### Approval %s\n\n", a.ID[:8]))
+			sb.WriteString(fmt.Sprintf("**Type:** %s  \n", a.Type))
+			sb.WriteString(fmt.Sprintf("**Title:** %s  \n", a.Title))
+			sb.WriteString(fmt.Sprintf("**Status:** %s  \n", a.Status))
+			sb.WriteString(fmt.Sprintf("**Requested:** %s  \n", a.RequestedAt.Format(time.RFC3339)))
+			if a.RespondedAt != nil {
+				sb.WriteString(fmt.Sprintf("**Responded:** %s  \n", a.RespondedAt.Format(time.RFC3339)))
+				sb.WriteString(fmt.Sprintf("**Decision:** %s  \n", map[bool]string{true: "Approved", false: "Rejected"}[*a.Decision]))
+				sb.WriteString(fmt.Sprintf("**Decided By:** %s  \n", a.DecidedBy))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(events) > 0 {
+		sb.WriteString("## Event Timeline\n\n")
+		for _, e := range events {
+			sb.WriteString(fmt.Sprintf("- **%s** [%s]  \n", e.Type, e.Timestamp.Format("15:04:05")))
+			if text, ok := e.Payload["text"].(string); ok && text != "" {
+				sb.WriteString(fmt.Sprintf("  %s  \n", text))
+			}
+			if tool, ok := e.Payload["tool_name"].(string); ok && tool != "" {
+				sb.WriteString(fmt.Sprintf("  Tool: %s  \n", tool))
+			}
+		}
+	}
+
+	sb.WriteString("\n---\n")
+	sb.WriteString(fmt.Sprintf("*Report generated at %s*\n", time.Now().Format(time.RFC3339)))
+
+	return sb.String(), nil
 }
 
 func (m *Manager) ContinueParkedTask(taskID string) error {

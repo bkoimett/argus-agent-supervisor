@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"os"
 	"testing"
@@ -255,5 +256,160 @@ func TestStoreListSessions(t *testing.T) {
 	}
 	if len(sessions) != 3 {
 		t.Errorf("Expected 3 sessions, got %d", len(sessions))
+	}
+}
+
+func TestMigrationAddsMissingColumns(t *testing.T) {
+	// Create a database with old schema (v1) - no supervision_enabled on sessions, no scope on approvals
+	dbPath := "/tmp/test_migration_" + time.Now().Format("20060102150405") + ".db"
+	defer os.Remove(dbPath)
+
+	// Create old schema manually
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	oldSchema := `
+	CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		project_dir TEXT NOT NULL,
+		agent TEXT NOT NULL DEFAULT 'opencode',
+		model TEXT,
+		status TEXT NOT NULL,
+		pid INTEGER,
+		started_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		ended_at DATETIME,
+		exit_code INTEGER,
+		error_message TEXT
+	);
+
+	CREATE TABLE tasks (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		prompt TEXT NOT NULL,
+		status TEXT NOT NULL,
+		dependencies TEXT NOT NULL DEFAULT '[]',
+		scope TEXT NOT NULL DEFAULT '',
+		started_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		ended_at DATETIME,
+		exit_code INTEGER,
+		error_message TEXT,
+		approval_id TEXT REFERENCES approvals(id),
+		recovery_count INTEGER NOT NULL DEFAULT 0
+	);
+
+	CREATE TABLE incidents (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+		type TEXT NOT NULL,
+		severity TEXT NOT NULL,
+		status TEXT NOT NULL,
+		evidence TEXT NOT NULL,
+		meta_diagnosis TEXT,
+		meta_recovery TEXT,
+		meta_source TEXT,
+		meta_model TEXT,
+		detected_at DATETIME NOT NULL,
+		diagnosed_at DATETIME,
+		proposed_at DATETIME,
+		approved_at DATETIME,
+		recovered_at DATETIME,
+		verified_at DATETIME,
+		recovery_attempts INTEGER NOT NULL DEFAULT 0
+	);
+
+	CREATE TABLE approvals (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+		incident_id TEXT REFERENCES incidents(id) ON DELETE SET NULL,
+		type TEXT NOT NULL,
+		status TEXT NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		requested_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		responded_at DATETIME,
+		decision INTEGER,
+		decided_by TEXT
+	);
+
+	CREATE TABLE recovery_actions (
+		id TEXT PRIMARY KEY,
+		incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+		type TEXT NOT NULL,
+		description TEXT NOT NULL,
+		command TEXT NOT NULL,
+		args TEXT NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL,
+		proposed_at DATETIME NOT NULL,
+		approved_at DATETIME,
+		executed_at DATETIME,
+		result TEXT
+	);
+
+	CREATE TABLE events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		type TEXT NOT NULL,
+		timestamp DATETIME NOT NULL,
+		payload TEXT NOT NULL
+	);
+	`
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	// Insert test data
+	if _, err := db.Exec(`
+		INSERT INTO sessions (id, project_dir, agent, model, status, pid, started_at, updated_at)
+		VALUES ('sess-1', '/tmp/test', 'opencode', 'test', 'RUNNING', 123, datetime('now'), datetime('now'))
+	`); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO approvals (id, session_id, type, status, title, description, payload, requested_at, expires_at)
+		VALUES ('appr-1', 'sess-1', 'PERMISSION', 'PENDING', 'Test', 'Desc', '{}', datetime('now'), datetime('now', '+5 minutes'))
+	`); err != nil {
+		t.Fatalf("insert approval: %v", err)
+	}
+	db.Close()
+
+	// Now open with NewStore which should run migrations
+	st, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore after migration failed: %v", err)
+	}
+	defer st.Close()
+
+	// Verify supervision_enabled column exists and has default value
+	session, err := st.GetSession("sess-1")
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if !session.SupervisionEnabled {
+		t.Errorf("Expected SupervisionEnabled=true (default), got false")
+	}
+
+	// Verify scope column exists on approvals
+	approval, err := st.GetApproval("appr-1")
+	if err != nil {
+		t.Fatalf("GetApproval failed: %v", err)
+	}
+	if approval.Scope != "" {
+		t.Errorf("Expected Scope='' (default), got %q", approval.Scope)
+	}
+
+	// Verify schema_version table was created and version is current
+	var version int
+	err = st.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version)
+	if err != nil {
+		t.Fatalf("query schema_version: %v", err)
+	}
+	if version != currentSchemaVersion {
+		t.Errorf("Expected schema version %d, got %d", currentSchemaVersion, version)
 	}
 }

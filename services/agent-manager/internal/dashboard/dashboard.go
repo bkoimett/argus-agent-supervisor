@@ -74,8 +74,14 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/recovery/", s.handleRecoveryByID)
 	mux.HandleFunc("/api/recovery/approval", s.handleRecoveryApproval)
 
+	// Report endpoint
+	mux.HandleFunc("GET /api/sessions/{id}/report", s.handleSessionReport)
+
 	// Diagnosis endpoint
 	mux.HandleFunc("/api/diagnosis", s.handleDiagnosis)
+	mux.HandleFunc("POST /api/meta/test-connection", s.handleMetaTestConnection)
+	mux.HandleFunc("GET /api/meta/config", s.handleMetaConfigGet)
+	mux.HandleFunc("POST /api/meta/config", s.handleMetaConfigSave)
 
 	// Event endpoints
 	mux.HandleFunc("/api/events", s.handleEvents)
@@ -218,6 +224,25 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
+	case http.MethodPatch:
+		// Handle session updates (e.g., supervision toggle)
+		var req struct {
+			SupervisionEnabled *bool `json:"supervision_enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.SupervisionEnabled != nil {
+			if err := s.mgr.SetSupervision(id, *req.SupervisionEnabled); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("set supervision: %w", err))
+				return
+			}
+			session, _ := s.mgr.GetSession(id)
+			writeJSON(w, http.StatusOK, session)
+			return
+		}
+		writeError(w, http.StatusBadRequest, fmt.Errorf("no valid fields to update"))
 	case http.MethodDelete:
 		if s.mgr == nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("session manager not configured"))
@@ -644,7 +669,31 @@ func (s *Server) handleRecoveryByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Recovery approval endpoints
+// handleSessionReport generates a markdown report for a session.
+func (s *Server) handleSessionReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, nil)
+		return
+	}
+
+	report, err := s.mgr.GenerateReport(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("generate report: %w", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/markdown")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session-%s-report.md\"", id[:8]))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(report))
+}
+
 func (s *Server) handleRecoveryApproval(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -692,6 +741,96 @@ func (s *Server) handleDiagnosis(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "diagnosis completed"})
+}
+
+// MetaTestConnection tests the Meta API connection.
+func (s *Server) handleMetaTestConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("meta client not configured"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	err := s.mgr.GetMetaClient().TestConnection(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Meta API connection successful",
+	})
+}
+
+// MetaConfigResponse represents the current Meta configuration.
+type MetaConfigResponse struct {
+	BaseURL string `json:"base_url"`
+	Model   string `json:"model"`
+	HasKey  bool   `json:"has_key"`
+}
+
+// handleMetaConfigGet returns the current Meta configuration (without the API key).
+func (s *Server) handleMetaConfigGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
+		writeJSON(w, http.StatusOK, MetaConfigResponse{
+			BaseURL: "",
+			Model:   "",
+			HasKey:  false,
+		})
+		return
+	}
+
+	client := s.mgr.GetMetaClient()
+	// We can't expose the API key, so just return base URL and model
+	writeJSON(w, http.StatusOK, MetaConfigResponse{
+		BaseURL: client.GetBaseURL(),
+		Model:   client.GetModel(),
+		HasKey:  client.IsEnabled(),
+	})
+}
+
+// handleMetaConfigSave saves the Meta configuration.
+func (s *Server) handleMetaConfigSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	var req struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Model   string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Update the meta client configuration
+	if s.mgr != nil && s.mgr.GetMetaClient() != nil {
+		s.mgr.GetMetaClient().UpdateConfig(req.BaseURL, req.APIKey, req.Model)
+	}
+
+	// Also update the environment (for persistence across restarts, would need .env file write)
+	// For now, just update the running client
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

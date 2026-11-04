@@ -734,14 +734,16 @@ func (m *mockDashboardAdapter) waitForSend(t *testing.T) {
 	}
 }
 
-func (m *mockDashboardAdapter) Stop(string) error                      { return nil }
-func (m *mockDashboardAdapter) Restart(string) error                   { return nil }
-func (m *mockDashboardAdapter) Status(string) (adapter.Status, error)  { return adapter.StatusWorking, nil }
-func (m *mockDashboardAdapter) Interrupt(string) error                 { return nil }
-func (m *mockDashboardAdapter) Abort(string) error                     { return nil }
+func (m *mockDashboardAdapter) Stop(string) error    { return nil }
+func (m *mockDashboardAdapter) Restart(string) error { return nil }
+func (m *mockDashboardAdapter) Status(string) (adapter.Status, error) {
+	return adapter.StatusWorking, nil
+}
+func (m *mockDashboardAdapter) Interrupt(string) error                         { return nil }
+func (m *mockDashboardAdapter) Abort(string) error                             { return nil }
 func (m *mockDashboardAdapter) RespondToPermission(string, string, bool) error { return nil }
-func (m *mockDashboardAdapter) GetEvents(string) ([]adapter.Event, error) { return nil, nil }
-func (m *mockDashboardAdapter) Close() error                           { return nil }
+func (m *mockDashboardAdapter) GetEvents(string) ([]adapter.Event, error)      { return nil, nil }
+func (m *mockDashboardAdapter) Close() error                                   { return nil }
 
 var _ adapter.AgentAdapter = (*mockDashboardAdapter)(nil)
 
@@ -919,43 +921,65 @@ func (m *mockSessionManager) CreateSession(ctx context.Context, projectDir, mode
 	}
 	// Return a minimal valid session for testing
 	return &state.Session{
-		ID:         "test-session-" + fmt.Sprintf("%d", time.Now().UnixNano()),
-		ProjectDir: projectDir,
-		Agent:      "opencode",
-		Model:      model,
-		Status:     state.SessionStatusRunning,
-		StartedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
-	}, &state.Task{
-		ID:        "test-task-" + fmt.Sprintf("%d", time.Now().UnixNano()),
-		SessionID: "",
-		Prompt:    prompt,
-		Status:    state.TaskStatusRunning,
-		Scope:     fmt.Sprintf("project:%s", projectDir),
-		StartedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}, nil
+			ID:         "test-session-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+			ProjectDir: projectDir,
+			Agent:      "opencode",
+			Model:      model,
+			Status:     state.SessionStatusRunning,
+			StartedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+		}, &state.Task{
+			ID:        "test-task-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+			SessionID: "",
+			Prompt:    prompt,
+			Status:    state.TaskStatusRunning,
+			Scope:     fmt.Sprintf("project:%s", projectDir),
+			StartedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}, nil
 }
 
 func (m *mockSessionManager) SendMessage(ctx context.Context, sessionID, message string) (*state.Session, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (m *mockSessionManager) StopSession(sessionID string) error { return nil }
-func (m *mockSessionManager) ListSessions() ([]*state.Session, error) { return nil, nil }
+func (m *mockSessionManager) StopSession(sessionID string) error           { return nil }
+func (m *mockSessionManager) ListSessions() ([]*state.Session, error)      { return nil, nil }
 func (m *mockSessionManager) GetSession(id string) (*state.Session, error) { return nil, nil }
-func (m *mockSessionManager) GetSessionTasks(sessionID string) ([]*state.Task, error) { return nil, nil }
-func (m *mockSessionManager) GetSessionIncidents(sessionID string) ([]*state.Incident, error) { return nil, nil }
-func (m *mockSessionManager) GetSessionEvents(sessionID string, limit int) ([]*state.Event, error) { return nil, nil }
-func (m *mockSessionManager) SubmitTask(sessionID, prompt, scope string, dependencies []string) (*state.Task, error) { return nil, nil }
+func (m *mockSessionManager) GetSessionTasks(sessionID string) ([]*state.Task, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) GetSessionIncidents(sessionID string) ([]*state.Incident, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) GetSessionEvents(sessionID string, limit int) ([]*state.Event, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) SubmitTask(sessionID, prompt, scope string, dependencies []string) (*state.Task, error) {
+	return nil, nil
+}
 func (m *mockSessionManager) RequestApproval(approval *state.Approval) error { return nil }
-func (m *mockSessionManager) RespondApproval(approvalID string, approved bool, decidedBy string) error { return nil }
+func (m *mockSessionManager) RespondApproval(approvalID string, approved bool, decidedBy string) error {
+	return nil
+}
 func (m *mockSessionManager) CreateIncident(inc *state.Incident) error { return nil }
 func (m *mockSessionManager) DiagnoseIncident(incidentID string) error { return nil }
-func (m *mockSessionManager) GetRecoveryAction(id string) (*state.RecoveryAction, error) { return nil, nil }
-func (m *mockSessionManager) ProposeRecovery(incidentID string, action *state.RecoveryAction) error { return nil }
-func (m *mockSessionManager) RequestRecoveryApproval(recoveryID string) (*state.Approval, error) { return nil, nil }
-func (m *mockSessionManager) ExecuteRecovery(recoveryID string) (*state.VerificationResult, error) { return nil, nil }
-func (m *mockSessionManager) DetectIncidentsFromEvents(sessionID string) ([]*state.Incident, error) { return nil, nil }
+func (m *mockSessionManager) GetRecoveryAction(id string) (*state.RecoveryAction, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) ProposeRecovery(incidentID string, action *state.RecoveryAction) error {
+	return nil
+}
+func (m *mockSessionManager) RequestRecoveryApproval(recoveryID string) (*state.Approval, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) ExecuteRecovery(recoveryID string) (*state.VerificationResult, error) {
+	return nil, nil
+}
+func (m *mockSessionManager) DetectIncidentsFromEvents(sessionID string) ([]*state.Incident, error) {
+	return nil, nil
+}
 func (m *mockSessionManager) RestoreSessions() error { return nil }
-func (m *mockSessionManager) RestoreSession(sessionID string) (*state.Session, *state.Task, error) { return nil, nil, nil }
+func (m *mockSessionManager) RestoreSession(sessionID string) (*state.Session, *state.Task, error) {
+	return nil, nil, nil
+}

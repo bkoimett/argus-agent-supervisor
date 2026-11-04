@@ -2,7 +2,7 @@
 -- Row Level Security is enabled on every table per docs/prd.md section 13,
 -- policies are added alongside auth wiring in M1.
 
-create table devices (
+create table if not exists devices (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null references auth.users (id) on delete cascade,
     name text not null,
@@ -10,7 +10,7 @@ create table devices (
     revoked_at timestamptz
 );
 
-create table projects (
+create table if not exists projects (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null references auth.users (id) on delete cascade,
     name text not null,
@@ -20,7 +20,7 @@ create table projects (
     created_at timestamptz not null default now()
 );
 
-create table sessions (
+create table if not exists sessions (
     id text primary key,
     project_id uuid references projects (id) on delete cascade,
     project_dir text not null default '',
@@ -29,7 +29,7 @@ create table sessions (
     ended_at timestamptz
 );
 
-create table events (
+create table if not exists events (
     id uuid primary key default gen_random_uuid(),
     session_id text not null references sessions (id) on delete cascade,
     type text not null,
@@ -37,7 +37,7 @@ create table events (
     created_at timestamptz not null default now()
 );
 
-create table commands (
+create table if not exists commands (
     id uuid primary key default gen_random_uuid(),
     session_id text not null references sessions (id) on delete cascade,
     type text not null,
@@ -46,7 +46,7 @@ create table commands (
     created_at timestamptz not null default now()
 );
 
-create table notification_preferences (
+create table if not exists notification_preferences (
     user_id uuid primary key references auth.users (id) on delete cascade,
     needs_input boolean not null default true,
     permission_required boolean not null default true,
@@ -55,7 +55,7 @@ create table notification_preferences (
     quota_warning boolean not null default true
 );
 
-create table pairing_codes (
+create table if not exists pairing_codes (
     id uuid primary key default gen_random_uuid(),
     code text not null unique,
     user_id uuid not null references auth.users (id) on delete cascade,
@@ -63,6 +63,9 @@ create table pairing_codes (
     created_at timestamptz not null default now()
 );
 
+-- ---------------------------------------------------------------
+-- Enable RLS (idempotent — enabling twice is a no-op)
+-- ---------------------------------------------------------------
 alter table devices enable row level security;
 alter table projects enable row level security;
 alter table sessions enable row level security;
@@ -71,21 +74,39 @@ alter table commands enable row level security;
 alter table notification_preferences enable row level security;
 alter table pairing_codes enable row level security;
 
--- RLS policies. Enabled per PRD section 13. These are permissive for the MVP
--- (authenticated role can read/write all rows) and must be refined with
--- auth.uid() scoping once Supabase auth is integrated. Without policies,
--- RLS with no policy blocks all access by default.
+-- ---------------------------------------------------------------
+-- RLS policies. Enabled per PRD section 13. These are permissive for the
+-- MVP (authenticated role can read/write all rows) and must be refined with
+-- auth.uid() scoping once Supabase auth is integrated.
+--
+-- NOTE: PostgreSQL has NO "CREATE POLICY IF NOT EXISTS" clause (that syntax
+-- only exists for tables, indexes, schemas, etc.). The idiomatic idempotent
+-- pattern is DROP POLICY IF EXISTS followed by CREATE POLICY.
+-- ---------------------------------------------------------------
+drop policy if exists sessions_all on sessions;
 create policy sessions_all on sessions
     for all to authenticated using (true) with check (true);
+
+drop policy if exists events_all on events;
 create policy events_all on events
     for all to authenticated using (true) with check (true);
+
+drop policy if exists commands_all on commands;
 create policy commands_all on commands
     for all to authenticated using (true) with check (true);
+
+drop policy if exists devices_all on devices;
 create policy devices_all on devices
     for all to authenticated using (true) with check (true);
+
+drop policy if exists projects_all on projects;
 create policy projects_all on projects
     for all to authenticated using (true) with check (true);
+
+drop policy if exists pairing_codes_all on pairing_codes;
 create policy pairing_codes_all on pairing_codes
     for all to authenticated using (true) with check (true);
+
+drop policy if exists notification_preferences_all on notification_preferences;
 create policy notification_preferences_all on notification_preferences
     for all to authenticated using (true) with check (true);
