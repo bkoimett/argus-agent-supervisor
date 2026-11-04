@@ -4,43 +4,36 @@ This file tracks the current work-in-progress plan. Updated after each completed
 
 ---
 
-## Current Focus: M0-02 (Next)
+## Current Focus: OpenCode Session Lifecycle (Interrupt vs Stop)
 
 **M0-01: DONE** - Environment and scaffold verified.
 
-**Next up: M0-02 OpenCode Compatibility Probe**
+**M0-02: DONE** - OpenCode compatibility probe completed (`opencode` 1.19.0, `opencode serve` headless interface verified).
 
-### M0-02 Plan
+### In progress: Lifecycle semantics (M5/M6 report)
 
-1. Check if `opencode` is installed and in PATH
-2. Run `opencode --version` to verify it works
-3. Run `opencode --help` to understand CLI flags
-4. Test spawning a trivial OpenCode session (e.g., `opencode run "echo hello"` or similar)
-5. Verify we can capture stdout/stderr and stop the process
-6. Document findings in PROGRESS.md
+Make `Interrupt`/`Stop`/`Restore` semantically correct and consistent across Go service, desktop UI, PWA, and docs.
+
+- **Interrupt:** stop current turn, retain session (WORKING). `POST /api/sessions/{id}/interrupt`.
+- **Stop:** mark session DETACHED in adapter and SQLite (not STOPPED — cannot confirm OpenCode process termination on shared serve). Best-effort interrupt, do NOT kill shared serve server (no per-session termination endpoint in OpenCode 1.19.0). Idempotent. `DELETE /api/sessions/{id}`.
+- **Restore:** mark original DETACHED, create NEW session for same project (do not claim reattachment). Accepts DISCONNECTED or DETACHED source state. `POST /api/sessions/{id}/restore`.
+
+### Acceptance Criteria
+- [ ] `Interrupt` stops turn, session retained, follow-up succeeds (mock + live tests)
+- [ ] `Stop` → DETACHED in SQLite and adapter, other sessions unaffected (mock + live tests)
+- [ ] Repeated Stop/Interrupt calls are idempotent (mock tests)
+- [ ] `Close` reaps serve process, no orphaned OpenCode server (live test)
+- [ ] Desktop UI shows DETACHED with explanation + Restore button (verified wiring)
+- [ ] PWA shows DETACHED status badge (verified)
+- [ ] `go test -race ./...`, `go vet ./...`, `go build ./...`, `gofmt` all PASS
+- [ ] PROGRESS.md and MILESTONES.md updated with actual behavior + honest gaps
+- [ ] PRD §10 state list conflict documented (DETACHED not in PRD list)
 
 ### Unknowns (Recorded per Instructions)
-
 | Item | Status | Notes |
 |------|--------|-------|
-| OpenCode API/CLI stability | UNKNOWN | Need to probe in M0-02 |
-| OpenCode JSON-RPC protocol | UNKNOWN | Need to probe in M0-02 |
-| Muse Code availability | UNKNOWN | Deferred, not in MVP scope |
-| Meta API availability | UNKNOWN | Deferred, not in MVP scope |
-| Supabase free tier limits (current) | UNKNOWN | Check at M1-04 |
-
-### V1.0 Scope Lock
-
-Per PRD section 6, the following are **explicitly not MVP** and will not be started until M1-M6 are proven with 2+ weeks daily use:
-
-- Resource Guardian (auto pause/stop)
-- Model switching / fallback routing
-- Git awareness beyond branch name + dirty flag
-- Machine resource monitoring (CPU, RAM, disk)
-- Task queue, agent handoffs, focus mode
-- Teams, workspaces, billing, marketplace
-- Native Android/iOS apps
-- Any second agent adapter beyond OpenCode
+| OpenCode per-session termination endpoint | UNKNOWN / NOT AVAILABLE | OpenCode 1.19.0 `serve` has no per-session kill; Stop cannot confirm process termination of one session |
+| OpenCode API/CLI stability | PROBED | `opencode serve` (1.19.0) headless interface verified; `opencode run` one-shot |
 
 ---
 

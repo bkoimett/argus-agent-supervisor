@@ -6,10 +6,13 @@ import React from 'react'
 interface NewSessionFormProps {
   onSubmit: (dir: string, prompt: string) => void
   onClose: () => void
+  // Server-reported error (e.g. create-session failure) shown inline in the
+  // form so it never flashes behind the modal or leaves the user guessing.
+  serverError?: string | null
 }
 
 export const NewSessionForm = React.memo(
-  function NewSessionForm({ onSubmit, onClose }: NewSessionFormProps) {
+  function NewSessionForm({ onSubmit, onClose, serverError }: NewSessionFormProps) {
     const [dir, setDir] = useState('')
     const [prompt, setPrompt] = useState('')
     const [error, setError] = useState<string | null>(null)
@@ -80,9 +83,9 @@ export const NewSessionForm = React.memo(
         <div className="bg-surface border border-border rounded-lg p-6 w-full max-w-md mx-4">
           <h2 className="text-lg font-medium mb-4">New Session</h2>
           <form onSubmit={handleSubmit} className="space-y-4" onReset={(e) => e.preventDefault()}>
-            {error && (
+            {(error || serverError) && (
               <div className="p-3 bg-red-500/20 border border-red-500/30 rounded text-red-400 text-sm">
-                {error}
+                {error || serverError}
               </div>
             )}
             <div>

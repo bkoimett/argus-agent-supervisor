@@ -20,6 +20,8 @@ tr:nth-child(even){background:#252526}
 .empty{color:#888}
 button{padding:4px 8px;background:#0e639c;color:#fff;border:none;border-radius:3px;cursor:pointer}
 button:disabled{background:#555;cursor:not-allowed}
+.meta-live{color:#4ec9b0;font-weight:bold}
+.meta-fallback{color:#dcdcaa}
 </style>
 </head>
 <body>
@@ -38,6 +40,18 @@ async function fetchJSON(url) {
 	return res.json();
 }
 function statusClass(s){return 'status-'+(s||'').toLowerCase();}
+function metaBadge(inc){
+	if (!inc.meta_source) return '';
+	if (inc.meta_source === 'live'){
+		var model = inc.meta_model || 'unknown';
+		return ' <span class="meta-live">Llama live ('+model+')</span>';
+	}
+	if (inc.meta_source === 'fallback'){
+		var reason = inc.fallback_reason || 'unknown';
+		return ' <span class="meta-fallback">Fallback ('+reason+')</span>';
+	}
+	return '';
+}
 function render() {
 	document.getElementById('status').textContent = 'Loading...';
 	document.getElementById('errorMsg').style.display='none';
@@ -56,7 +70,7 @@ function render() {
 			data.forEach(sess => {
 				const tr = document.createElement('tr');
 				const taskInfo = sess.tasks && sess.tasks.length? sess.tasks.map(t=>'<div>'+t.prompt+' <span class="'+statusClass(t.status)+'">['+t.status+']</span></div>').join('') : '<span class="empty">none</span>';
-				const incInfo = sess.incidents && sess.incidents.length? sess.incidents.map(i=>'<div>'+i.type+' <span class="'+statusClass(i.status)+'">['+i.status+']</span></div>').join('') : '<span class="empty">none</span>';
+				const incInfo = sess.incidents && sess.incidents.length? sess.incidents.map(i=>'<div>'+i.type+' <span class="'+statusClass(i.status)+'">['+i.status+']</span>'+metaBadge(i)+'</div>').join('') : '<span class="empty">none</span>';
 				const apprInfo = sess.approvals && sess.approvals.length? sess.approvals.map(a=>'<div>'+a.title+' <span class="'+statusClass(a.status)+'">['+a.status+']</span> <button onclick="approve(\''+a.id+'\')">Approve</button> <button onclick="reject(\''+a.id+'\')">Reject</button></div>').join('') : '<span class="empty">none</span>';
 				const recActions = sess.recovery_actions || [];
 				const recInfo = recActions.length? recActions.map(ra=>{

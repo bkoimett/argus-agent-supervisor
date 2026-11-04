@@ -2,6 +2,7 @@
 package dashboard
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -10,22 +11,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/argus-command-center/argus/services/agent-manager/internal/adapter"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/session"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/state"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/store"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/supabase"
 	"github.com/google/uuid"
 )
 
 // Server is the HTTP dashboard server.
 type Server struct {
-	mgr   *session.Manager
-	store *store.Store
-	port  string
+	mgr       *session.Manager
+	store     *store.Store
+	adapter   adapter.AgentAdapter
+	sbClient  *supabase.Client
+	port      string
+	startTime time.Time
 }
 
-// NewServer creates a new dashboard server.
-func NewServer(mgr *session.Manager, st *store.Store, port string) *Server {
-	return &Server{mgr: mgr, store: st, port: port}
+// NewServer creates a new dashboard server. startTime records when the
+// service process began, so /health can identify this instance and clients
+// can distinguish it from a stale service already bound to the port.
+func NewServer(mgr *session.Manager, st *store.Store, port string, opencodeAdapter adapter.AgentAdapter, sbClient *supabase.Client, startTime time.Time) *Server {
+	return &Server{mgr: mgr, store: st, adapter: opencodeAdapter, sbClient: sbClient, port: port, startTime: startTime}
 }
 
 // Start starts the HTTP server.
@@ -35,12 +43,19 @@ func (s *Server) Start() error {
 	// Serve static dashboard UI
 	mux.Handle("/", http.FileServer(http.Dir("./internal/dashboard/static")))
 
-	// Health check
+	// Health check. Reports started_at so callers can verify they are
+	// talking to the instance they launched (not a stale one).
 	mux.HandleFunc("/health", s.handleHealth)
 
 	// Session endpoints
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByID)
+	mux.HandleFunc("POST /api/sessions/{id}/message", s.handleSendMessage)
+	mux.HandleFunc("POST /api/sessions/{id}/interrupt", s.handleInterruptSession)
+	mux.HandleFunc("POST /api/sessions/{id}/restore", s.handleRestoreSession)
+
+	// Pairing endpoint
+	mux.HandleFunc("POST /api/pairing-code", s.handlePairingCode)
 
 	// Task endpoints
 	mux.HandleFunc("/api/tasks", s.handleTasks)
@@ -59,8 +74,14 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/recovery/", s.handleRecoveryByID)
 	mux.HandleFunc("/api/recovery/approval", s.handleRecoveryApproval)
 
+	// Report endpoint
+	mux.HandleFunc("GET /api/sessions/{id}/report", s.handleSessionReport)
+
 	// Diagnosis endpoint
 	mux.HandleFunc("/api/diagnosis", s.handleDiagnosis)
+	mux.HandleFunc("POST /api/meta/test-connection", s.handleMetaTestConnection)
+	mux.HandleFunc("GET /api/meta/config", s.handleMetaConfigGet)
+	mux.HandleFunc("POST /api/meta/config", s.handleMetaConfigSave)
 
 	// Event endpoints
 	mux.HandleFunc("/api/events", s.handleEvents)
@@ -88,7 +109,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 		"http://127.0.0.1:5173": true,
 		"http://localhost:8080": true, // Go service self
 		"http://127.0.0.1:8080": true,
-		"tauri://localhost":       true, // Tauri custom scheme (production)
+		"tauri://localhost":     true, // Tauri custom scheme (production)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -108,7 +129,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":     "ok",
+		"started_at": s.startTime.UnixMilli(),
+	})
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -134,14 +158,51 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("project_dir is required"))
 			return
 		}
-		session, task, err := s.mgr.CreateSession(r.Context(), req.ProjectDir, req.Model, req.Prompt)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+
+		// Create a persistent OpenCode session via the session manager
+		// (uses subprocess path with correct working directory).
+		if s.mgr == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("session manager not configured"))
 			return
 		}
+		// Idempotency: if a session for this project directory already exists
+		// in a non-terminal state, return it instead of creating a duplicate.
+		// This prevents duplicate sessions when the user retries after a
+		// transient failure or when a stale service handled the first attempt.
+		existing, err := s.findExistingSession(req.ProjectDir)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("list sessions: %w", err))
+			return
+		}
+		if existing != nil {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"session":    existing,
+				"session_id": existing.ID,
+			})
+			return
+		}
+
+		sess, task, err := s.mgr.CreateSession(context.Background(), req.ProjectDir, req.Model, req.Prompt)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("create session: %w", err))
+			return
+		}
+
+		// Sync session to Supabase so paired phones can see it.
+		if s.sbClient != nil && s.sbClient.IsEnabled() {
+			if err := s.sbClient.SyncSession(context.Background(), sess); err != nil {
+				fmt.Printf("Supabase sync session error: %v\n", err)
+			}
+		}
+		if task != nil && s.sbClient != nil && s.sbClient.IsEnabled() {
+			if err := s.sbClient.SyncTask(context.Background(), task); err != nil {
+				fmt.Printf("Supabase sync task error: %v\n", err)
+			}
+		}
+
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			"session": session,
-			"task":    task,
+			"session":    sess,
+			"session_id": sess.ID,
 		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, nil)
@@ -163,15 +224,147 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
-	case http.MethodDelete:
-		if err := s.mgr.StopSession(id); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+	case http.MethodPatch:
+		// Handle session updates (e.g., supervision toggle)
+		var req struct {
+			SupervisionEnabled *bool `json:"supervision_enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+		if req.SupervisionEnabled != nil {
+			if err := s.mgr.SetSupervision(id, *req.SupervisionEnabled); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("set supervision: %w", err))
+				return
+			}
+			session, _ := s.mgr.GetSession(id)
+			writeJSON(w, http.StatusOK, session)
+			return
+		}
+		writeError(w, http.StatusBadRequest, fmt.Errorf("no valid fields to update"))
+	case http.MethodDelete:
+		if s.mgr == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("session manager not configured"))
+			return
+		}
+		if err := s.mgr.StopSession(id); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("stop session: %w", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "detached", "session_id": id})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, nil)
 	}
+}
+
+func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, nil)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Message == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("message is required"))
+		return
+	}
+	if s.mgr == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("session manager not configured"))
+		return
+	}
+	// Use the manager's SendMessage which routes through subprocess with correct CWD
+	sess, err := s.mgr.SendMessage(r.Context(), id, req.Message)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("send message: %w", err))
+		return
+	}
+
+	// The manager's SendMessage persists events via the subprocess stdout parsing
+	// Return the updated session state
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session_id": id,
+		"status":     sess.Status,
+	})
+}
+
+func (s *Server) handleInterruptSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, nil)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+	if s.mgr == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("session manager not configured"))
+		return
+	}
+	// Use the adapter for interrupt since we don't have a manager-level interrupt yet
+	if s.adapter == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("OpenCode adapter not configured"))
+		return
+	}
+	if err := s.adapter.Interrupt(id); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("interrupt session: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "interrupted"})
+}
+
+func (s *Server) handleRestoreSession(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/api/sessions/"):]
+	if id == "" {
+		writeError(w, http.StatusBadRequest, nil)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+	if s.adapter == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("OpenCode adapter not configured"))
+		return
+	}
+	sess, task, err := s.mgr.RestoreSession(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("restore session: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"session":    sess,
+		"task":       task,
+		"session_id": sess.ID,
+	})
+}
+
+func (s *Server) handlePairingCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+	if s.sbClient == nil || !s.sbClient.IsEnabled() {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Supabase not enabled"))
+		return
+	}
+	code, err := s.sbClient.GeneratePairingCode(context.Background(), "desktop")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("generate pairing code: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"code": code})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +669,31 @@ func (s *Server) handleRecoveryByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Recovery approval endpoints
+// handleSessionReport generates a markdown report for a session.
+func (s *Server) handleSessionReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, nil)
+		return
+	}
+
+	report, err := s.mgr.GenerateReport(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("generate report: %w", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/markdown")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session-%s-report.md\"", id[:8]))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(report))
+}
+
 func (s *Server) handleRecoveryApproval(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -524,6 +741,96 @@ func (s *Server) handleDiagnosis(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "diagnosis completed"})
+}
+
+// MetaTestConnection tests the Meta API connection.
+func (s *Server) handleMetaTestConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("meta client not configured"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	err := s.mgr.GetMetaClient().TestConnection(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Meta API connection successful",
+	})
+}
+
+// MetaConfigResponse represents the current Meta configuration.
+type MetaConfigResponse struct {
+	BaseURL string `json:"base_url"`
+	Model   string `json:"model"`
+	HasKey  bool   `json:"has_key"`
+}
+
+// handleMetaConfigGet returns the current Meta configuration (without the API key).
+func (s *Server) handleMetaConfigGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
+		writeJSON(w, http.StatusOK, MetaConfigResponse{
+			BaseURL: "",
+			Model:   "",
+			HasKey:  false,
+		})
+		return
+	}
+
+	client := s.mgr.GetMetaClient()
+	// We can't expose the API key, so just return base URL and model
+	writeJSON(w, http.StatusOK, MetaConfigResponse{
+		BaseURL: client.GetBaseURL(),
+		Model:   client.GetModel(),
+		HasKey:  client.IsEnabled(),
+	})
+}
+
+// handleMetaConfigSave saves the Meta configuration.
+func (s *Server) handleMetaConfigSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, nil)
+		return
+	}
+
+	var req struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Model   string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Update the meta client configuration
+	if s.mgr != nil && s.mgr.GetMetaClient() != nil {
+		s.mgr.GetMetaClient().UpdateConfig(req.BaseURL, req.APIKey, req.Model)
+	}
+
+	// Also update the environment (for persistence across restarts, would need .env file write)
+	// For now, just update the running client
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -641,4 +948,36 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// reusableStatus reports whether a session in the given state can be reused
+// for a new create-session request instead of spawning a duplicate. Terminal
+// states and states where Argus explicitly stopped tracking (DISCONNECTED,
+// DETACHED) are not reused: the user should start a fresh session or restore.
+func reusableStatus(status state.SessionStatus) bool {
+	switch status {
+	case state.SessionStatusStarting,
+		state.SessionStatusRunning,
+		state.SessionStatusWaiting,
+		state.SessionStatusParked,
+		state.SessionStatusPaused:
+		return true
+	default:
+		return false
+	}
+}
+
+// findExistingSession returns a reusable session for the given project dir, or
+// nil if none exists.
+func (s *Server) findExistingSession(projectDir string) (*state.Session, error) {
+	sessions, err := s.mgr.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	for _, sess := range sessions {
+		if sess.ProjectDir == projectDir && reusableStatus(sess.Status) {
+			return sess, nil
+		}
+	}
+	return nil, nil
 }
