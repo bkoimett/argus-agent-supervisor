@@ -5,6 +5,8 @@ Argus. Multiple coding agents. One command center.
 
 Argus is a lightweight command center for AI coding agents. Run several agents at once on your own machine, walk away, and stay in control from your phone.
 
+![Home Screen](img/home_screen.png)
+
 ## Why Argus
 
 Named after Argus Panoptes, the hundred eyed giant of Greek myth who never truly slept. Argus watches every agent session at once so you don't have to.
@@ -16,6 +18,40 @@ Named after Argus Panoptes, the hundred eyed giant of Greek myth who never truly
 - Respond, approve, or deny requests from your phone, anywhere
 - See quota and session state at a glance
 - Recover automatically from a closed laptop lid, a lost connection, or a crash
+
+![Live Sessions](img/live_sessions.png)
+
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph Phone["📱 Phone (React PWA)"]
+        PWA[PWA Dashboard\nSession list\nApproval composer]
+    end
+
+    subgraph Cloud["☁️ Control Plane (Supabase Free Tier)"]
+        Auth[(Auth)]
+        DB[(Postgres\nSessions, Events, Commands)]
+        RT[Realtime\nWebSocket]
+    end
+
+    subgraph Laptop["💻 Laptop (Local-First)"]
+        Desktop[Tauri Desktop App\nProject cards\nLive session badges]
+        GoSvc[Go Service\nProcess manager\nAgent adapters\nSQLite state]
+        OpenCode[(OpenCode processes\nOne per project)]
+    end
+
+    PWA <-- HTTPS/WSS --> Auth
+    PWA <-- HTTPS/WSS --> DB
+    PWA <-- WSS --> RT
+    RT --> GoSvc
+    GoSvc --> OpenCode
+    Desktop --> GoSvc
+    GoSvc -.-> DB
+    GoSvc -.-> RT
+```
+
+*The laptop always initiates the outbound connection. Nothing on the laptop is ever reachable from the public internet directly. Provider API keys stay on the laptop, never uploaded to the control plane.*
 
 ## Status
 
@@ -35,6 +71,19 @@ docs                     Product, marketing and monetization documents
 
 Tauri 2, Go, React with TypeScript, Vite and Tailwind, Supabase (Postgres, Auth, Realtime), SQLite locally.
 
+## Built with Muse Wonder
+
+This project was developed using **Muse Wonder** — an AI-native coding assistant that helped accelerate development across the stack:
+
+- **Architecture & scaffolding** — Initial monorepo structure, Tauri + Go service skeleton, Supabase schema design
+- **Agent adapter implementation** — OpenCode adapter with process lifecycle management (start, stop, restart, interrupt, send message)
+- **Desktop dashboard** — React components for project cards, session state badges, activity logs, and quota bars
+- **PWA remote control** — Pairing code flow, Supabase Realtime subscriptions, approval composer for permission requests
+- **Notification system** — Web Push (VAPID) and ntfy.sh fallback with deduplication and event-driven rules
+- **Reliability hardening** — Session restore on reboot, GUI crash survival, network loss/reconnect handling
+
+Muse Wonder's ability to maintain context across the full stack (Go, React, TypeScript, SQL, Tauri config) made it possible to build a working multi-agent command center in a single hackathon sprint.
+
 ## Getting started (agent-manager only — the only runnable component right now)
 
 ```bash
@@ -50,6 +99,18 @@ go build -o agent-manager ./cmd/agent-manager
 ```
 
 Open **http://localhost:8080/** in a browser to see the dashboard UI.
+
+![New Session](img/new_session_main.png)
+![Agent Config](img/agent_config.png)
+
+### Quick demo flow for reviewers
+
+1. **Start the service** — runs the Go agent-manager with HTTP dashboard on port 8080
+2. **Add a project** — click "Add Project", pick a local directory
+3. **Launch a session** — click "Start" on the project card, enter a prompt
+4. **Watch it work** — see live status badge cycle: STARTING → WORKING → WAITING/PERMISSION_REQUIRED
+5. **Respond from the dashboard** — approve/deny permission requests inline
+6. **Pair with PWA** (when wired) — generate pairing code, open PWA on phone, enter code
 
 ### API endpoints (for scripting)
 
@@ -71,6 +132,27 @@ Open **http://localhost:8080/** in a browser to see the dashboard UI.
 - Meta diagnosis uses a deterministic fallback unless `--meta-api-key` is supplied.
 - Approval workflow is manual via the dashboard; no mobile UI yet.
 - No quota display, no model switching, no git awareness, no resource guardian.
+
+![Gus Questions](img/gus_questions.png)
+![Full Gus Workflow](img/full_gus_work.png)
+
+## Hackathon highlights
+
+| Category | Achievement |
+|----------|-------------|
+| **Architecture** | Local-first, agent-agnostic design with clean adapter interface — swap OpenCode for Claude Code, Codex, Gemini CLI without touching UI or control plane |
+| **Offline-first** | Sessions survive GUI crash, laptop sleep/wake, network loss; SQLite state syncs when connection returns |
+| **Security** | Zero public ports on laptop; outbound-only connection; API keys never leave machine; RLS on every Supabase table |
+| **Cost** | Entire stack runs on free tiers (Supabase, ntfy.sh, Web Push) — no credit card required to demo |
+| **Built with AI** | Muse Wonder accelerated full-stack development: Go service, Tauri desktop, React PWA, Supabase schema, notifications |
+
+## What's next (Post-MVP)
+
+- Resource Guardian (auto-pause on quota/limits)
+- Model switching & fallback routing
+- Git awareness (branch, dirty state, diff summary)
+- Second agent adapter (Claude Code, Codex, Gemini CLI)
+- Native mobile apps
 
 ## Guides for AI assistants working in this repo
 
