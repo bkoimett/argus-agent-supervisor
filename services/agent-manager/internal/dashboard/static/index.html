@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Argus Dashboard</title>
+<style>
+body{font-family:Arial,sans-serif;margin:20px;background:#1e1e1e;color:#d4d4d4}
+h1{color:#fff}
+table{width:100%;border-collapse:collapse;margin-bottom:20px}
+th,td{border:1px solid #333;padding:8px;text-align:left}
+th{background:#2d2d2d}
+tr:nth-child(even){background:#252526}
+.status-running{color:#4ec9b0}
+.status-completed{color:#6a9955}
+.status-error{color:#f44747}
+.status-parked{color:#dcdcaa}
+.status-pending{color:#9cdcfe}
+.loading{color:#9cdcfe}
+.error{color:#f44747}
+.empty{color:#888}
+button{padding:4px 8px;background:#0e639c;color:#fff;border:none;border-radius:3px;cursor:pointer}
+button:disabled{background:#555;cursor:not-allowed}
+.meta-live{color:#4ec9b0;font-weight:bold}
+.meta-fallback{color:#dcdcaa}
+</style>
+</head>
+<body>
+<h1>Argus Dashboard</h1>
+<div id="status" class="loading">Loading...</div>
+<table id="sessionsTable" style="display:none">
+<thead><tr><th>Session ID</th><th>Project</th><th>Agent</th><th>Status</th><th>PID</th><th>Tasks</th><th>Incidents</th><th>Approvals</th><th>Recovery</th><th>Actions</th></tr></thead>
+<tbody></tbody>
+</table>
+<div id="errorMsg" class="error" style="display:none"></div>
+
+<script>
+async function fetchJSON(url) {
+	const res = await fetch(url);
+	if (!res.ok) throw new Error(res.statusText);
+	return res.json();
+}
+function statusClass(s){return 'status-'+(s||'').toLowerCase();}
+function metaBadge(inc){
+	if (!inc.meta_source) return '';
+	if (inc.meta_source === 'live'){
+		var model = inc.meta_model || 'unknown';
+		return ' <span class="meta-live">Llama live ('+model+')</span>';
+	}
+	if (inc.meta_source === 'fallback'){
+		var reason = inc.fallback_reason || 'unknown';
+		return ' <span class="meta-fallback">Fallback ('+reason+')</span>';
+	}
+	return '';
+}
+function render() {
+	document.getElementById('status').textContent = 'Loading...';
+	document.getElementById('errorMsg').style.display='none';
+	fetchJSON('/api/dashboard')
+		.then(data => {
+			const tbody = document.querySelector('#sessionsTable tbody');
+			tbody.innerHTML = '';
+			if (!data || data.length===0) {
+				document.getElementById('status').className='empty';
+				document.getElementById('status').textContent = 'No sessions';
+				document.getElementById('sessionsTable').style.display='none';
+				return;
+			}
+			document.getElementById('status').style.display='none';
+			document.getElementById('sessionsTable').style.display='table';
+			data.forEach(sess => {
+				const tr = document.createElement('tr');
+				const taskInfo = sess.tasks && sess.tasks.length? sess.tasks.map(t=>'<div>'+t.prompt+' <span class="'+statusClass(t.status)+'">['+t.status+']</span></div>').join('') : '<span class="empty">none</span>';
+				const incInfo = sess.incidents && sess.incidents.length? sess.incidents.map(i=>'<div>'+i.type+' <span class="'+statusClass(i.status)+'">['+i.status+']</span>'+metaBadge(i)+'</div>').join('') : '<span class="empty">none</span>';
+				const apprInfo = sess.approvals && sess.approvals.length? sess.approvals.map(a=>'<div>'+a.title+' <span class="'+statusClass(a.status)+'">['+a.status+']</span> <button onclick="approve(\''+a.id+'\')">Approve</button> <button onclick="reject(\''+a.id+'\')">Reject</button></div>').join('') : '<span class="empty">none</span>';
+				const recActions = sess.recovery_actions || [];
+				const recInfo = recActions.length? recActions.map(ra=>{
+					let statusLabel = ra.status;
+					if (ra.result && ra.result.needs_review) statusLabel += ' <span class="status-pending">[Needs review]</span>';
+					return '<div>'+ra.type+' <span class="'+statusClass(ra.status)+'">['+statusLabel+']</span><br/>'+ra.description+'<br/><code>'+ra.command+' '+(ra.args||[]).join(' ')+'</code><br/>Incident: '+ra.incident_id.slice(0,8)+'\u2026</div>';
+				}).join('<hr/>') : '<span class="empty">none</span>';
+				tr.innerHTML = '<td>'+sess.id.slice(0,8)+'\u2026</td><td>'+sess.project_dir+'</td><td>'+sess.agent+'</td><td class="'+statusClass(sess.status)+'">'+sess.status+'</td><td>'+(sess.pid||'')+'</td><td>'+taskInfo+'</td><td>'+incInfo+'</td><td>'+apprInfo+'</td><td>'+recInfo+'</td><td><button onclick="viewEvents(\''+sess.id+'\')">Events</button></td>';
+				tbody.appendChild(tr);
+			});
+		})
+		.catch(err => {
+			document.getElementById('status').style.display='none';
+			document.getElementById('errorMsg').style.display='block';
+			document.getElementById('errorMsg').textContent = 'Error loading dashboard: '+err;
+		});
+}
+function statusClass(s){return 'status-'+(s||'').toLowerCase();}
+function approve(id){fetch('/api/approvals/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved:true,decided_by:'ui'})}).then(r=>r.json()).then(render).catch(alert);}
+function reject(id){fetch('/api/approvals/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved:false,decided_by:'ui'})}).then(r=>r.json()).then(render).catch(alert);}
+function viewEvents(id){window.open('/api/events?session_id='+id,'_blank');}
+setInterval(render,5000);
+render();
+</script>
+</body>
+</html>

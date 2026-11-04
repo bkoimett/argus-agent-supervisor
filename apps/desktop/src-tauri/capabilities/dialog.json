@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "dialog-capability",
+  "description": "Capability for dialog plugin",
+  "windows": ["main"],
+  "permissions": [
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-confirm",
+    "dialog:allow-message",
+    "dialog:allow-ask"
+  ]
+}

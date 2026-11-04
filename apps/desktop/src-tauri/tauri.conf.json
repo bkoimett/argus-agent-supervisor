@@ -16,6 +16,29 @@
         "width": 1100,
         "height": 720
       }
-    ]
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  },
+  "plugins": {
+    "shell": {
+      "open": true,
+      "command": {
+        "scope": {
+          "allow": [
+            {
+              "name": "agent-manager",
+              "cmd": "agent-manager",
+              "args": ["--port=8080", "--db=argus.db"]
+            }
+          ]
+        }
+      }
+    }
   }
 }
