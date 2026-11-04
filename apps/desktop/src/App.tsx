@@ -121,39 +121,52 @@ async function restoreSession(sessionId: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to restore session')
 }
 
-async function fetchMetaConfig(): Promise<{ baseUrl: string; model: string; hasKey: boolean } | null> {
+async function fetchMetaConfig(): Promise<{ baseUrl: string; model: string; hasKey: boolean; configured: boolean } | null> {
   try {
     const res = await fetch(`${API_BASE}/api/meta/config`)
     if (!res.ok) return null
-    return res.json()
+    const d = await res.json()
+    // Backend uses snake_case.
+    return { baseUrl: d.base_url ?? '', model: d.model ?? '', hasKey: !!d.has_key, configured: !!d.configured }
   } catch {
     return null
   }
 }
 
-async function testMetaConnection(baseUrl: string, apiKey: string, model: string): Promise<{ success: boolean; error?: string }> {
+type MetaResult = { success: boolean; error?: string; requestId?: string; baseUrl?: string; model?: string }
+
+async function parseMetaResult(res: Response): Promise<MetaResult> {
+  let d: Record<string, unknown> = {}
+  try { d = await res.json() } catch { /* non-JSON error body */ }
+  const requestId = (d.request_id as string) || res.headers.get('X-Request-Id') || undefined
+  if (!res.ok || d.success === false) {
+    const detail = (d.error as string) || `Request failed (HTTP ${res.status})`
+    return { success: false, error: requestId ? `${detail} [request ${requestId}]` : detail, requestId }
+  }
+  return { success: true, requestId, baseUrl: d.base_url as string, model: d.model as string }
+}
+
+async function testMetaConnection(baseUrl: string, apiKey: string, model: string): Promise<MetaResult> {
   try {
     const res = await fetch(`${API_BASE}/api/meta/test-connection`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseUrl, apiKey, model }),
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, model }),
     })
-    if (!res.ok) return { success: false, error: 'Request failed' }
-    return res.json()
+    return parseMetaResult(res)
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : 'Connection failed' }
   }
 }
 
-async function saveMetaConfig(baseUrl: string, apiKey: string, model: string): Promise<{ success: boolean; error?: string }> {
+async function saveMetaConfig(baseUrl: string, apiKey: string, model: string): Promise<MetaResult> {
   try {
     const res = await fetch(`${API_BASE}/api/meta/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseUrl, apiKey, model }),
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, model }),
     })
-    if (!res.ok) return { success: false, error: 'Request failed' }
-    return res.json()
+    return parseMetaResult(res)
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : 'Save failed' }
   }
@@ -335,15 +348,25 @@ export default function App() {
     apiKey: string
     model: string
   }>({ baseUrl: '', apiKey: '', model: '' })
-  const [metaConfigError, setMetaConfigError] = useState<string | null>(null)
-  const [metaConfigSuccess, setMetaConfigSuccess] = useState<string | null>(null)
+  const [metaSaveError, setMetaSaveError] = useState<string | null>(null)
+  const [metaSaveSuccess, setMetaSaveSuccess] = useState<string | null>(null)
+  const [metaTestError, setMetaTestError] = useState<string | null>(null)
+  const [metaTestSuccess, setMetaTestSuccess] = useState<string | null>(null)
   const [metaTesting, setMetaTesting] = useState(false)
+  const [metaSaving, setMetaSaving] = useState(false)
+  const [metaConfigured, setMetaConfigured] = useState<boolean | null>(null)
+  const [savedMeta, setSavedMeta] = useState<{ baseUrl: string; model: string } | null>(null)
+  const metaDirty = savedMeta !== null && (savedMeta.baseUrl !== metaConfig.baseUrl.trim().replace(/\/$/, '') || savedMeta.model !== metaConfig.model.trim())
 
   // Fetch meta config on mount
   useEffect(() => {
     fetchMetaConfig().then((config) => {
       if (config) {
         setMetaConfig({ baseUrl: config.baseUrl, apiKey: '', model: config.model })
+        setSavedMeta({ baseUrl: config.baseUrl, model: config.model })
+        setMetaConfigured(config.configured)
+      } else {
+        setMetaConfigured(false)
       }
     })
   }, [])
@@ -477,6 +500,32 @@ export default function App() {
           </div>
         )}
 
+        {/* Argus assistant (GUS): always visible, even when unconfigured */}
+        <section aria-label="Argus assistant" className="mb-6 p-4 bg-surface border border-border rounded">
+          <div className="flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <h2 className="text-sm font-medium">Argus assistant</h2>
+              {metaConfigured === null ? (
+                <p className="text-sm text-textMuted mt-1">Checking assistant configuration...</p>
+              ) : metaConfigured ? (
+                <p className="text-sm text-textMuted mt-1">
+                  Configured{metaConfig.model ? ` with model ${metaConfig.model}` : ''}{metaConfig.baseUrl ? ` at ${metaConfig.baseUrl}` : ''}. Use Test Connection in Settings to verify the provider responds.
+                </p>
+              ) : (
+                <p className="text-sm text-textMuted mt-1">
+                  Not configured. The assistant cannot diagnose incidents or propose recovery actions until a Meta-compatible model is set up. No assistant response will be generated.
+                </p>
+              )}
+            </div>
+            <button
+              onClick={() => setShowSettings(true)}
+              className="px-4 py-2 bg-surfaceHover hover:bg-border border border-border rounded font-medium focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {metaConfigured ? 'Assistant settings' : 'Configure assistant in Settings'}
+            </button>
+          </div>
+        </section>
+
         {/* Sessions by lifecycle: live, disconnected, past */}
         {!showNewSession && (
           <>
@@ -555,7 +604,7 @@ export default function App() {
             <div className="bg-surface border border-border rounded-lg p-6 w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-lg font-medium">Argus Assistant Settings</h2>
-                <button onClick={() => setShowSettings(false)} className="text-textMuted hover:text-text">×</button>
+                <button aria-label="Close settings" onClick={() => setShowSettings(false)} className="text-textMuted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent rounded px-1">×</button>
               </div>
 
               <div className="space-y-6">
@@ -586,19 +635,32 @@ export default function App() {
                     Supports OpenAI API, local LLMs (Ollama, LM Studio), and other OpenAI-compatible endpoints.
                   </p>
 
-                  {(metaConfigError || metaConfigSuccess) && (
-                    <div className={`p-3 rounded text-sm ${
-                      metaConfigError ? 'bg-red-500/20 border border-red-500/30 text-red-400' :
-                      'bg-green-500/10 border border-green-500/20 text-green-400'
-                    }`}>
-                      {metaConfigError || metaConfigSuccess}
+                  {metaConfigured === false && (
+                    <div role="status" className="p-3 rounded text-sm bg-amber-500/10 border border-amber-500/30 text-amber-300">
+                      Not configured. Enter a base URL, model, and API key if your provider requires one, then Save.
                     </div>
+                  )}
+                  {metaSaveError && (
+                    <div role="alert" className="p-3 rounded text-sm bg-red-500/20 border border-red-500/30 text-red-400">{metaSaveError}</div>
+                  )}
+                  {metaSaveSuccess && (
+                    <div role="status" className="p-3 rounded text-sm bg-green-500/10 border border-green-500/20 text-green-400">{metaSaveSuccess}</div>
+                  )}
+                  {metaTestError && (
+                    <div role="alert" className="p-3 rounded text-sm bg-red-500/20 border border-red-500/30 text-red-400">Test connection: {metaTestError}</div>
+                  )}
+                  {metaTestSuccess && (
+                    <div role="status" className="p-3 rounded text-sm bg-blue-500/10 border border-blue-500/20 text-blue-300">{metaTestSuccess}</div>
+                  )}
+                  {metaDirty && !metaSaveSuccess && (
+                    <p className="text-xs text-amber-300">Unsaved changes. Save to persist them across a service restart.</p>
                   )}
 
                   <div className="space-y-4">
                     <div>
-                      <label className="block text-sm font-medium mb-1">API Base URL</label>
+                      <label htmlFor="meta-base-url" className="block text-sm font-medium mb-1">API Base URL</label>
                       <input
+                        id="meta-base-url"
                         type="text"
                         value={metaConfig.baseUrl}
                         onChange={(e) => setMetaConfig({ ...metaConfig, baseUrl: e.target.value })}
@@ -611,8 +673,9 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-sm font-medium mb-1">API Key</label>
+                      <label htmlFor="meta-api-key" className="block text-sm font-medium mb-1">API Key</label>
                       <input
+                        id="meta-api-key"
                         type="password"
                         value={metaConfig.apiKey}
                         onChange={(e) => setMetaConfig({ ...metaConfig, apiKey: e.target.value })}
@@ -625,8 +688,9 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-sm font-medium mb-1">Model Name</label>
+                      <label htmlFor="meta-model" className="block text-sm font-medium mb-1">Model Name</label>
                       <input
+                        id="meta-model"
                         type="text"
                         value={metaConfig.model}
                         onChange={(e) => setMetaConfig({ ...metaConfig, model: e.target.value })}
@@ -643,36 +707,48 @@ export default function App() {
                     <button
                       onClick={async () => {
                         setMetaTesting(true)
-                        setMetaConfigError(null)
-                        setMetaConfigSuccess(null)
+                        setMetaTestError(null)
+                        setMetaTestSuccess(null)
                         const result = await testMetaConnection(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
                         setMetaTesting(false)
                         if (result.success) {
-                          setMetaConfigSuccess('Connection successful!')
+                          setMetaTestSuccess('Test connection succeeded. This does not save the configuration.')
                         } else {
-                          setMetaConfigError(result.error || 'Connection failed')
+                          setMetaTestError(result.error || 'Connection failed')
                         }
                       }}
-                      disabled={metaTesting || !metaConfig.baseUrl || !metaConfig.model}
+                      disabled={metaTesting || !metaConfig.baseUrl || !metaConfig.model} aria-busy={metaTesting}
                       className="flex-1 px-4 py-2 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {metaTesting ? 'Testing...' : 'Test Connection'}
                     </button>
                     <button
                       onClick={async () => {
-                        setMetaConfigError(null)
-                        setMetaConfigSuccess(null)
+                        setMetaSaving(true)
+                        setMetaSaveError(null)
+                        setMetaSaveSuccess(null)
                         const result = await saveMetaConfig(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
+                        setMetaSaving(false)
                         if (result.success) {
-                          setMetaConfigSuccess('Configuration saved!')
+                          // Only claim success after the backend persisted and
+                          // reloaded the config; re-read it to confirm.
+                          const confirmed = await fetchMetaConfig()
+                          if (confirmed && confirmed.baseUrl && confirmed.model) {
+                            setMetaConfig({ baseUrl: confirmed.baseUrl, apiKey: '', model: confirmed.model })
+                            setSavedMeta({ baseUrl: confirmed.baseUrl, model: confirmed.model })
+                            setMetaConfigured(confirmed.configured)
+                            setMetaSaveSuccess(`Saved and verified after reload: ${confirmed.model} at ${confirmed.baseUrl}. It will persist across a service restart.`)
+                          } else {
+                            setMetaSaveError('Save reported success but the reloaded configuration could not be verified. Check the Go service log.')
+                          }
                         } else {
-                          setMetaConfigError(result.error || 'Save failed')
+                          setMetaSaveError(result.error || 'Save failed')
                         }
                       }}
-                      disabled={!metaConfig.baseUrl || !metaConfig.model}
-                      className="flex-1 px-4 py-2 bg-accent hover:bg-accentHover text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                      disabled={metaSaving || !metaConfig.baseUrl || !metaConfig.model}
+                      className="flex-1 px-4 py-2 bg-accent hover:bg-accentHover text-white rounded disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-accent"
                     >
-                      Save
+                      {metaSaving ? 'Saving...' : 'Save'}
                     </button>
                   </div>
                 </div>

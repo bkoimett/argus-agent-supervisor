@@ -71,7 +71,7 @@ type Client struct {
 func NewClient(config Config) *Client {
 	enabled := config.APIKey != "" && config.BaseURL != ""
 	if !enabled {
-		return &Client{config: Config{Enabled: false}}
+		return &Client{config: Config{APIKey: config.APIKey, BaseURL: strings.TrimSuffix(config.BaseURL, "/"), Model: config.Model, Enabled: false}, http: &http.Client{Timeout: 30 * time.Second}}
 	}
 	return &Client{
 		config: Config{
@@ -110,6 +110,18 @@ func (c *Client) UpdateConfig(baseURL, apiKey, model string) {
 		Model:   model,
 		Enabled: enabled,
 	}
+}
+
+// WithOverrides returns a client using the given values, falling back to
+// this client's stored API key when key is blank. The key is never exposed.
+func (c *Client) WithOverrides(baseURL, apiKey, model string) *Client {
+	if apiKey == "" {
+		apiKey = c.config.APIKey
+	}
+	if model == "" {
+		model = c.config.Model
+	}
+	return NewClient(Config{APIKey: apiKey, BaseURL: baseURL, Model: model})
 }
 
 // DiagnosisRequest represents a request for incident diagnosis.

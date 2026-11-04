@@ -6,12 +6,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/argus-command-center/argus/services/agent-manager/internal/adapter"
+	"github.com/argus-command-center/argus/services/agent-manager/internal/meta"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/session"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/state"
 	"github.com/argus-command-center/argus/services/agent-manager/internal/store"
@@ -27,6 +31,20 @@ type Server struct {
 	sbClient  *supabase.Client
 	port      string
 	startTime time.Time
+	// MetaEnvPath is the .env file Meta config Save persists to.
+	MetaEnvPath string
+	// metaClientOverride is used by tests; normally the client comes from mgr.
+	metaClientOverride *meta.Client
+}
+
+func (s *Server) metaClient() *meta.Client {
+	if s.metaClientOverride != nil {
+		return s.metaClientOverride
+	}
+	if s.mgr != nil {
+		return s.mgr.GetMetaClient()
+	}
+	return nil
 }
 
 // NewServer creates a new dashboard server. startTime records when the
@@ -750,15 +768,27 @@ func (s *Server) handleMetaTestConnection(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
+	client := s.metaClient()
+	var req metaConfigRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	req.normalize()
+	if req.BaseURL != "" {
+		if client != nil {
+			client = client.WithOverrides(req.BaseURL, req.APIKey, req.Model)
+		} else {
+			client = meta.NewClient(meta.Config{APIKey: req.APIKey, BaseURL: req.BaseURL, Model: req.Model})
+		}
+	}
+	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("meta client not configured"))
 		return
 	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	err := s.mgr.GetMetaClient().TestConnection(ctx)
+	err := client.TestConnection(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": false,
@@ -775,62 +805,121 @@ func (s *Server) handleMetaTestConnection(w http.ResponseWriter, r *http.Request
 
 // MetaConfigResponse represents the current Meta configuration.
 type MetaConfigResponse struct {
-	BaseURL string `json:"base_url"`
-	Model   string `json:"model"`
-	HasKey  bool   `json:"has_key"`
+	BaseURL    string `json:"base_url"`
+	Model      string `json:"model"`
+	HasKey     bool   `json:"has_key"`
+	Configured bool   `json:"configured"`
+	RequestID  string `json:"request_id,omitempty"`
+}
+
+// metaConfigRequest accepts both snake_case and camelCase field names. The
+// desktop app historically sent camelCase while this handler decoded
+// snake_case, so every value arrived empty: that mismatch, plus the absence
+// of any file write, was the root cause of Save appearing to fail.
+type metaConfigRequest struct {
+	BaseURL    string `json:"base_url"`
+	BaseURLAlt string `json:"baseUrl"`
+	APIKey     string `json:"api_key"`
+	APIKeyAlt  string `json:"apiKey"`
+	Model      string `json:"model"`
+}
+
+func (r *metaConfigRequest) normalize() {
+	if r.BaseURL == "" {
+		r.BaseURL = r.BaseURLAlt
+	}
+	if r.APIKey == "" {
+		r.APIKey = r.APIKeyAlt
+	}
+	r.BaseURL = strings.TrimSuffix(strings.TrimSpace(r.BaseURL), "/")
+	r.Model = strings.TrimSpace(r.Model)
+}
+
+func (s *Server) metaEnvPath() string {
+	if s.MetaEnvPath != "" {
+		return s.MetaEnvPath
+	}
+	return ResolveMetaEnvPath()
+}
+
+func writeMetaError(w http.ResponseWriter, status int, reqID, op string, err error, secret string) {
+	msg := redactSecret(fmt.Sprintf("%s: %v", op, err), secret)
+	log.Printf("meta config request_id=%s op=%q error=%q", reqID, op, msg)
+	w.Header().Set("X-Request-Id", reqID)
+	writeJSON(w, status, map[string]interface{}{"success": false, "error": msg, "request_id": reqID})
 }
 
 // handleMetaConfigGet returns the current Meta configuration (without the API key).
 func (s *Server) handleMetaConfigGet(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, nil)
+	client := s.metaClient()
+	if client == nil {
+		writeJSON(w, http.StatusOK, MetaConfigResponse{})
 		return
 	}
-
-	if s.mgr == nil || s.mgr.GetMetaClient() == nil {
-		writeJSON(w, http.StatusOK, MetaConfigResponse{
-			BaseURL: "",
-			Model:   "",
-			HasKey:  false,
-		})
-		return
-	}
-
-	client := s.mgr.GetMetaClient()
-	// We can't expose the API key, so just return base URL and model
 	writeJSON(w, http.StatusOK, MetaConfigResponse{
-		BaseURL: client.GetBaseURL(),
-		Model:   client.GetModel(),
-		HasKey:  client.IsEnabled(),
+		BaseURL: client.GetBaseURL(), Model: client.GetModel(),
+		HasKey: client.IsEnabled(), Configured: client.GetBaseURL() != "" && client.GetModel() != "",
 	})
 }
 
-// handleMetaConfigSave saves the Meta configuration.
+// handleMetaConfigSave validates, persists to the .env file, reloads that
+// file to verify, and only then updates the running client.
 func (s *Server) handleMetaConfigSave(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, nil)
-		return
-	}
-
-	var req struct {
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
-		Model   string `json:"model"`
-	}
+	reqID := uuid.NewString()
+	w.Header().Set("X-Request-Id", reqID)
+	var req metaConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeMetaError(w, http.StatusBadRequest, reqID, "decode save request", err, "")
 		return
 	}
-
-	// Update the meta client configuration
-	if s.mgr != nil && s.mgr.GetMetaClient() != nil {
-		s.mgr.GetMetaClient().UpdateConfig(req.BaseURL, req.APIKey, req.Model)
+	req.normalize()
+	if req.BaseURL == "" {
+		writeMetaError(w, http.StatusBadRequest, reqID, "validate save request", fmt.Errorf("base_url is required"), req.APIKey)
+		return
 	}
-
-	// Also update the environment (for persistence across restarts, would need .env file write)
-	// For now, just update the running client
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+	if u, err := url.Parse(req.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		writeMetaError(w, http.StatusBadRequest, reqID, "validate save request", fmt.Errorf("base_url %q must be an http or https URL with a host", req.BaseURL), req.APIKey)
+		return
+	}
+	if req.Model == "" {
+		writeMetaError(w, http.StatusBadRequest, reqID, "validate save request", fmt.Errorf("model is required"), req.APIKey)
+		return
+	}
+	// Preserve an existing key (from the file being written) when the form
+	// submits a blank key, so saving URL/model does not wipe credentials.
+	effectiveKey := req.APIKey
+	if effectiveKey == "" {
+		if vals, err := readMetaEnvFile(s.metaEnvPath()); err == nil {
+			effectiveKey = vals["META_API_KEY"]
+		}
+	}
+	path := s.metaEnvPath()
+	if err := writeMetaEnvFile(path, req.BaseURL, effectiveKey, req.Model); err != nil {
+		writeMetaError(w, http.StatusInternalServerError, reqID, "save meta config", err, req.APIKey)
+		return
+	}
+	vals, err := readMetaEnvFile(path)
+	if err != nil {
+		writeMetaError(w, http.StatusInternalServerError, reqID, "verify saved meta config", err, req.APIKey)
+		return
+	}
+	if vals["META_BASE_URL"] != req.BaseURL || vals["META_MODEL"] != req.Model || (effectiveKey != "" && vals["META_API_KEY"] != effectiveKey) {
+		writeMetaError(w, http.StatusInternalServerError, reqID, "verify saved meta config", fmt.Errorf("reloaded values do not match saved base_url/model"), req.APIKey)
+		return
+	}
+	_ = os.Setenv("META_BASE_URL", req.BaseURL)
+	_ = os.Setenv("META_MODEL", req.Model)
+	if effectiveKey != "" {
+		_ = os.Setenv("META_API_KEY", effectiveKey)
+	}
+	if client := s.metaClient(); client != nil {
+		client.UpdateConfig(req.BaseURL, effectiveKey, req.Model)
+	}
+	log.Printf("meta config saved request_id=%s base_url=%s model=%s path=%s", reqID, req.BaseURL, req.Model, path)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "status": "saved", "base_url": req.BaseURL, "model": req.Model,
+		"has_key": effectiveKey != "", "configured": true, "request_id": reqID,
+	})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
