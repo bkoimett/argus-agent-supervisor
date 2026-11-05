@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -90,6 +91,9 @@ func NewClient(config Config) *Client {
 func (c *Client) IsEnabled() bool {
 	return c.config.Enabled
 }
+
+// HasAPIKey reports whether an API key is present, independent of base URL.
+func (c *Client) HasAPIKey() bool { return c.config.APIKey != "" }
 
 // GetBaseURL returns the base URL of the Meta API.
 func (c *Client) GetBaseURL() string {
@@ -319,43 +323,118 @@ func RedactEvidence(evidence json.RawMessage) json.RawMessage {
 	return redacted
 }
 
-// TestConnection tests the Meta API connection by making a simple request.
+// TestConnection verifies the credential and model with an authenticated
+// request. It first tries GET /models (credential check plus model list);
+// providers without /models fall back to a minimal chat completion. A bare
+// 200 from an unauthenticated route is never treated as success. Error
+// messages never contain the API key.
 func (c *Client) TestConnection(ctx context.Context) error {
-	if !c.config.Enabled {
-		return fmt.Errorf("meta client not enabled (missing API key or base URL)")
+	if c.config.BaseURL == "" {
+		return fmt.Errorf("missing base URL: enter the provider base URL")
 	}
-
-	// Send a minimal test request
-	chatReq := map[string]interface{}{
-		"model": c.config.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": "test"},
-		},
-		"max_tokens": 5,
+	if c.config.Model == "" {
+		return fmt.Errorf("missing model: enter a model name")
 	}
-
-	body, err := json.Marshal(chatReq)
+	if c.config.APIKey == "" {
+		return fmt.Errorf("missing API key: enter an API key, or save one first and leave the field blank to use it")
+	}
+	status, body, err := c.doAuthed(ctx, http.MethodGet, "/models", nil)
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return fmt.Errorf("test connection: %w", err)
 	}
-
-	url := c.config.BaseURL + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		return c.testViaChat(ctx)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	if err := statusError("test connection", status, body, c.config.APIKey); err != nil {
+		return err
+	}
+	// If the provider returned a model list, the selected model must be on it.
+	var list struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
+		for _, m := range list.Data {
+			if m.ID == c.config.Model {
+				return nil
+			}
+		}
+		return fmt.Errorf("model %q is not available from this provider (not in its model list)", c.config.Model)
+	}
+	return nil
+}
 
-	resp, err := c.http.Do(httpReq)
+func (c *Client) testViaChat(ctx context.Context) error {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"model":      c.config.Model,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
+	})
+	status, body, err := c.doAuthed(ctx, http.MethodPost, "/chat/completions", payload)
 	if err != nil {
-		return fmt.Errorf("http error: %w", err)
+		return fmt.Errorf("test connection: %w", err)
+	}
+	if err := statusError("test connection", status, body, c.config.APIKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) doAuthed(ctx context.Context, method, path string, payload []byte) (int, []byte, error) {
+	var rdr io.Reader
+	if payload != nil {
+		rdr = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.config.BaseURL+path, rdr)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request to provider failed: %w", err)
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, body, nil
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d", resp.StatusCode)
+// statusError maps a provider status to a safe, useful message. The API key
+// is redacted if the provider echoes it back.
+func statusError(op string, status int, body []byte, apiKey string) error {
+	if status >= 200 && status < 300 {
+		return nil
 	}
-
-	return nil
+	detail := strings.TrimSpace(string(body))
+	if apiKey != "" {
+		detail = strings.ReplaceAll(detail, apiKey, "[redacted]")
+	}
+	// Prefer the provider's structured error message, truncated.
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
+		detail = parsed.Error.Message
+		if apiKey != "" {
+			detail = strings.ReplaceAll(detail, apiKey, "[redacted]")
+		}
+	}
+	if len(detail) > 200 {
+		detail = detail[:200]
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return fmt.Errorf("%s: provider rejected the API key (HTTP %d): %s", op, status, detail)
+	case status == http.StatusNotFound:
+		return fmt.Errorf("%s: provider returned HTTP 404 (check the base URL, and that the model exists): %s", op, detail)
+	case status == http.StatusBadRequest && strings.Contains(strings.ToLower(detail), "model"):
+		return fmt.Errorf("%s: provider rejected the request, model may be unavailable (HTTP %d): %s", op, status, detail)
+	default:
+		return fmt.Errorf("%s: provider returned HTTP %d: %s", op, status, detail)
+	}
 }

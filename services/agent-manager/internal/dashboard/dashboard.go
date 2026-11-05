@@ -761,45 +761,46 @@ func (s *Server) handleDiagnosis(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "diagnosis completed"})
 }
 
-// MetaTestConnection tests the Meta API connection.
+// MetaTestConnection tests the provider using the current (possibly
+// unsaved) form values. It never persists anything and never mutates the
+// running client. A blank API key falls back to the already saved key; an
+// entered key always takes precedence, so a fake entered key must fail.
 func (s *Server) handleMetaTestConnection(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, nil)
-		return
-	}
-
-	client := s.metaClient()
+	reqID := uuid.NewString()
+	w.Header().Set("X-Request-Id", reqID)
 	var req metaConfigRequest
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeMetaError(w, http.StatusBadRequest, reqID, "decode test request", err, "")
+		return
 	}
 	req.normalize()
-	if req.BaseURL != "" {
-		if client != nil {
-			client = client.WithOverrides(req.BaseURL, req.APIKey, req.Model)
-		} else {
-			client = meta.NewClient(meta.Config{APIKey: req.APIKey, BaseURL: req.BaseURL, Model: req.Model})
-		}
-	}
-	if client == nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("meta client not configured"))
+	if req.BaseURL == "" || req.Model == "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": false, "request_id": reqID,
+			"error": "test connection: base_url and model are required"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	var client *meta.Client
+	if existing := s.metaClient(); existing != nil {
+		// WithOverrides uses the entered key, else the stored one.
+		client = existing.WithOverrides(req.BaseURL, req.APIKey, req.Model)
+	} else {
+		client = meta.NewClient(meta.Config{APIKey: req.APIKey, BaseURL: req.BaseURL, Model: req.Model})
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-
-	err := client.TestConnection(ctx)
-	if err != nil {
+	if err := client.TestConnection(ctx); err != nil {
+		// Log only the safe message; it never contains the API key.
+		log.Printf("meta test-connection request_id=%s base_url=%s model=%s result=failure error=%q", reqID, req.BaseURL, req.Model, err.Error())
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"success": false,
-			"error":   err.Error(),
+			"success": false, "error": err.Error(), "request_id": reqID,
+			"base_url": req.BaseURL, "model": req.Model,
 		})
 		return
 	}
-
+	log.Printf("meta test-connection request_id=%s base_url=%s model=%s result=success", reqID, req.BaseURL, req.Model)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Meta API connection successful",
+		"success": true, "message": "Provider accepted the API key and model",
+		"request_id": reqID, "base_url": req.BaseURL, "model": req.Model,
 	})
 }
 
@@ -835,6 +836,12 @@ func (r *metaConfigRequest) normalize() {
 	r.Model = strings.TrimSpace(r.Model)
 }
 
+// metaConfigured is the single definition of "configured" used by both the
+// GET response and Save: base URL, model, and API key must all be present.
+func metaConfigured(c *meta.Client) bool {
+	return c != nil && c.GetBaseURL() != "" && c.GetModel() != "" && c.HasAPIKey()
+}
+
 func (s *Server) metaEnvPath() string {
 	if s.MetaEnvPath != "" {
 		return s.MetaEnvPath
@@ -849,8 +856,23 @@ func writeMetaError(w http.ResponseWriter, status int, reqID, op string, err err
 	writeJSON(w, status, map[string]interface{}{"success": false, "error": msg, "request_id": reqID})
 }
 
-// handleMetaConfigGet returns the current Meta configuration (without the API key).
+// handleMetaConfigGet returns the current Meta configuration (without the
+// API key). The persisted .env file is the source of truth: it is re-read on
+// every GET and applied to the running client, so this endpoint, Save, and a
+// restarted service all report the same configuration even if the running
+// client was started before the file changed.
 func (s *Server) handleMetaConfigGet(w http.ResponseWriter, r *http.Request) {
+	if vals, err := readMetaEnvFile(s.metaEnvPath()); err == nil && (vals["META_BASE_URL"] != "" || vals["META_MODEL"] != "") {
+		if client := s.metaClient(); client != nil {
+			key := vals["META_API_KEY"]
+			if key == "" && client.HasAPIKey() {
+				// Key supplied via environment/flags at startup, not the file.
+				// Keep the running client as-is rather than wiping its key.
+			} else {
+				client.UpdateConfig(vals["META_BASE_URL"], key, vals["META_MODEL"])
+			}
+		}
+	}
 	client := s.metaClient()
 	if client == nil {
 		writeJSON(w, http.StatusOK, MetaConfigResponse{})
@@ -858,7 +880,7 @@ func (s *Server) handleMetaConfigGet(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, MetaConfigResponse{
 		BaseURL: client.GetBaseURL(), Model: client.GetModel(),
-		HasKey: client.IsEnabled(), Configured: client.GetBaseURL() != "" && client.GetModel() != "",
+		HasKey: client.HasAPIKey(), Configured: metaConfigured(client),
 	})
 }
 
@@ -918,7 +940,7 @@ func (s *Server) handleMetaConfigSave(w http.ResponseWriter, r *http.Request) {
 	log.Printf("meta config saved request_id=%s base_url=%s model=%s path=%s", reqID, req.BaseURL, req.Model, path)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true, "status": "saved", "base_url": req.BaseURL, "model": req.Model,
-		"has_key": effectiveKey != "", "configured": true, "request_id": reqID,
+		"has_key": effectiveKey != "", "configured": req.BaseURL != "" && req.Model != "" && effectiveKey != "", "request_id": reqID,
 	})
 }
 

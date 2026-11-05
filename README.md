@@ -62,6 +62,26 @@ Open **http://localhost:8080/** in a browser to see the dashboard UI.
 - `POST /api/diagnosis` – body `{ "incident_id": "..." }` requests Meta/fallback diagnosis
 - `POST /api/recovery/approval` – body `{ "recovery_id": "..." }` creates approval for a recovery action
 - `POST /api/approvals/{id}` – body `{ "approved": true, "decided_by": "user" }` approves/rejects
+- `GET /api/meta/config` returns the assistant configuration status (`base_url`, `model`, `has_key`, `configured`). The API key itself is never returned.
+- `POST /api/meta/config` saves the assistant configuration (see below)
+- `POST /api/meta/test-connection` tests the provider with the submitted values without saving them
+- `PATCH /api/sessions/{id}` with body `{ "supervision_enabled": false }` toggles GUS supervision for one session
+
+## Assistant (GUS) configuration
+
+The desktop dashboard includes an Argus assistant panel (GUS) that diagnoses incidents and proposes recovery actions through a Meta-compatible, OpenAI-style API (for example Meta AI, OpenAI, Ollama, or LM Studio).
+
+To configure it:
+
+1. Start the Go service, then open the desktop dashboard and choose Settings.
+2. Enter the API base URL (including `/v1` if your provider requires it), the model name, and your API key.
+3. Choose Test Connection to verify the provider accepts the key and offers the model. Testing uses the values currently in the form, including a newly entered key, and does not save anything.
+4. Choose Save. The service writes `META_BASE_URL`, `META_API_KEY`, and `META_MODEL` to its `.env` file (file permissions `0600`), reloads the file to verify the write, and only then reports success. Saved settings survive a service restart. You can also set `ARGUS_ENV_FILE` to choose which `.env` file is used.
+5. Restart note: if the dashboard still reports the assistant as not configured after saving, make sure no older agent-manager process is still holding port 8080, and start the newly built service.
+
+The API key is stored only on your machine in the `.env` file. It is never stored in the browser, never returned by the API, and never written to service logs. In Settings, a blank key field keeps the already saved key; enter a new key only to replace it.
+
+Each session card, and the opened session view, has a Show GUS / Hide GUS control and a Supervision toggle. Supervision is stored per session in the local database. It only takes effect when a model is configured; when no model is configured, the GUS panel says so and supervision controls are disabled instead of implying the assistant is working.
 
 ### Limitations (MVP)
 

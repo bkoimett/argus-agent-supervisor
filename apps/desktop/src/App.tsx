@@ -74,6 +74,18 @@ interface DashboardData {
   approvals: Approval[]
   recent_events: Event[]
   recovery_actions: unknown[]
+  supervision_enabled?: boolean
+}
+
+async function setSessionSupervision(sessionId: string, enabled: boolean): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ supervision_enabled: enabled }),
+  })
+  if (!res.ok) throw new Error('Failed to update supervision')
+  const d = await res.json()
+  return !!d.supervision_enabled
 }
 
 const API_BASE = 'http://localhost:8080'
@@ -127,13 +139,17 @@ async function fetchMetaConfig(): Promise<{ baseUrl: string; model: string; hasK
     if (!res.ok) return null
     const d = await res.json()
     // Backend uses snake_case.
-    return { baseUrl: d.base_url ?? '', model: d.model ?? '', hasKey: !!d.has_key, configured: !!d.configured }
+    const baseUrl = d.base_url ?? ''
+    const model = d.model ?? ''
+    const hasKey = !!d.has_key
+    const configured = typeof d.configured === 'boolean' ? d.configured : (baseUrl !== '' && model !== '' && hasKey)
+    return { baseUrl, model, hasKey, configured }
   } catch {
     return null
   }
 }
 
-type MetaResult = { success: boolean; error?: string; requestId?: string; baseUrl?: string; model?: string }
+type MetaResult = { success: boolean; error?: string; requestId?: string; baseUrl?: string; model?: string; hasKey?: boolean; configured?: boolean }
 
 async function parseMetaResult(res: Response): Promise<MetaResult> {
   let d: Record<string, unknown> = {}
@@ -143,7 +159,7 @@ async function parseMetaResult(res: Response): Promise<MetaResult> {
     const detail = (d.error as string) || `Request failed (HTTP ${res.status})`
     return { success: false, error: requestId ? `${detail} [request ${requestId}]` : detail, requestId }
   }
-  return { success: true, requestId, baseUrl: d.base_url as string, model: d.model as string }
+  return { success: true, requestId, baseUrl: d.base_url as string, model: d.model as string, hasKey: d.has_key as boolean, configured: d.configured as boolean }
 }
 
 async function testMetaConnection(baseUrl: string, apiKey: string, model: string): Promise<MetaResult> {
@@ -199,14 +215,104 @@ function statusClass(status: string): string {
   }
 }
 
+
+// GusControls is the per-session GUS control set, used both on session cards
+// and in the opened session view, so GUS access does not disappear when a
+// session is opened. Panel visibility is local UI state persisted per
+// session; supervision is real backend state persisted per session.
+function GusControls({
+  session,
+  metaConfigured,
+  onOpenSettings,
+  onRefresh,
+}: {
+  session: DashboardData
+  metaConfigured: boolean | null
+  onOpenSettings: () => void
+  onRefresh: () => void
+}) {
+  const gusStorageKey = `argus_gus_visible_${session.id}`
+  const [gusVisible, setGusVisible] = useState<boolean>(() => {
+    try { return localStorage.getItem(gusStorageKey) === 'true' } catch { return false }
+  })
+  const [supervision, setSupervision] = useState<boolean>(!!session.supervision_enabled)
+  const [supervisionError, setSupervisionError] = useState<string | null>(null)
+  useEffect(() => { setSupervision(!!session.supervision_enabled) }, [session.supervision_enabled])
+  const toggleGus = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setGusVisible((v) => {
+      try { localStorage.setItem(gusStorageKey, String(!v)) } catch { /* storage unavailable */ }
+      return !v
+    })
+  }
+  const toggleSupervision = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    e.stopPropagation()
+    const next = e.target.checked
+    setSupervision(next)
+    setSupervisionError(null)
+    try {
+      const confirmed = await setSessionSupervision(session.id, next)
+      setSupervision(confirmed)
+      onRefresh()
+    } catch {
+      setSupervision(!next)
+      setSupervisionError('Could not update supervision. Is the Go service running?')
+    }
+  }
+  return (
+      <div className="p-4 pt-0" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            onClick={toggleGus}
+            aria-expanded={gusVisible}
+            className="px-3 py-1 text-sm bg-surfaceHover hover:bg-border border border-border rounded focus:outline-none focus:ring-2 focus:ring-accent"
+          >
+            {gusVisible ? 'Hide GUS' : 'Show GUS'}
+          </button>
+          <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <input
+              type="checkbox"
+              checked={supervision}
+              onChange={toggleSupervision}
+              disabled={!metaConfigured}
+              aria-label={`GUS supervision for session in ${session.project_dir}`}
+              className="w-4 h-4 rounded border-border bg-surface text-accent focus:ring-accent disabled:opacity-50"
+            />
+            <span>Supervision</span>
+          </label>
+          {!metaConfigured && <span className="text-xs text-textMuted">Supervision unavailable until a model is configured.</span>}
+          {supervisionError && <span role="alert" className="text-xs text-red-400">{supervisionError}</span>}
+        </div>
+        {gusVisible && (
+          <div className="mt-3 p-3 bg-surface/50 border border-border/50 rounded text-sm" aria-label="GUS assistant panel">
+            {!metaConfigured ? (
+              <>
+                <p className="text-textMuted">GUS is not configured, so the assistant cannot diagnose this session or propose recovery actions. No assistant response will be generated.</p>
+                <button onClick={onOpenSettings} className="mt-2 px-3 py-1 text-sm bg-surfaceHover hover:bg-border border border-border rounded focus:outline-none focus:ring-2 focus:ring-accent">Configure assistant in Settings</button>
+              </>
+            ) : supervision ? (
+              <p className="text-textMuted">Supervision is on for this session. GUS will diagnose incidents and propose recovery actions for approval. {(session.incidents ?? []).length} incident{(session.incidents ?? []).length === 1 ? '' : 's'} recorded for this session.</p>
+            ) : (
+              <p className="text-textMuted">Supervision is off for this session. Turn it on above to let GUS diagnose incidents and propose recovery actions.</p>
+            )}
+          </div>
+        )}
+      </div>
+  )
+}
+
 function SessionCard({
   session,
   onRefresh,
   onSelect,
+  metaConfigured,
+  onOpenSettings,
 }: {
   session: DashboardData
   onRefresh: () => void
   onSelect?: () => void
+  metaConfigured: boolean | null
+  onOpenSettings: () => void
 }) {
   const handleRestore = () => {
     restoreSession(session.id).then(onRefresh)
@@ -275,7 +381,7 @@ function SessionCard({
           )}
         </div>
       </div>
-
+      <GusControls session={session} metaConfigured={metaConfigured} onOpenSettings={onOpenSettings} onRefresh={onRefresh} />
     </div>
   )
 }
@@ -300,12 +406,16 @@ function SessionSection({
   onRefresh,
   onSelect,
   note,
+  metaConfigured,
+  onOpenSettings,
 }: {
   title: string
   sessions: DashboardData[]
   onRefresh: () => void
   onSelect: (session: DashboardData) => void
   note?: string
+  metaConfigured: boolean | null
+  onOpenSettings: () => void
 }) {
   if (sessions.length === 0) return null
 
@@ -326,6 +436,8 @@ function SessionSection({
             session={session}
             onRefresh={onRefresh}
             onSelect={() => onSelect(session)}
+            metaConfigured={metaConfigured}
+            onOpenSettings={onOpenSettings}
           />
         ))}
       </div>
@@ -355,21 +467,32 @@ export default function App() {
   const [metaTesting, setMetaTesting] = useState(false)
   const [metaSaving, setMetaSaving] = useState(false)
   const [metaConfigured, setMetaConfigured] = useState<boolean | null>(null)
+  const [metaHasKey, setMetaHasKey] = useState(false)
   const [savedMeta, setSavedMeta] = useState<{ baseUrl: string; model: string } | null>(null)
   const metaDirty = savedMeta !== null && (savedMeta.baseUrl !== metaConfig.baseUrl.trim().replace(/\/$/, '') || savedMeta.model !== metaConfig.model.trim())
 
-  // Fetch meta config on mount
+  // Single status source: the backend /api/meta/config response. Refreshed
+  // on mount and periodically, so the dashboard panel and Settings never
+  // disagree, and a slow-starting service does not leave a stale
+  // "not configured" state. Form fields are only populated from the server
+  // when the user has no unsaved edits.
+  const metaDirtyRef = useCallback((cfg: { baseUrl: string; model: string }, saved: { baseUrl: string; model: string } | null) =>
+    saved !== null && (saved.baseUrl !== cfg.baseUrl.trim().replace(/\/$/, '') || saved.model !== cfg.model.trim()), [])
+  const refreshMetaConfig = useCallback(async (populateForm: boolean) => {
+    const config = await fetchMetaConfig()
+    if (!config) return // keep last known state; do not flap to "not configured"
+    setMetaConfigured(config.configured)
+    setMetaHasKey(config.hasKey)
+    setSavedMeta({ baseUrl: config.baseUrl, model: config.model })
+    if (populateForm) {
+      setMetaConfig((prev) => (metaDirtyRef(prev, savedMeta) ? prev : { baseUrl: config.baseUrl, apiKey: prev.apiKey, model: config.model }))
+    }
+  }, [metaDirtyRef, savedMeta])
+  useEffect(() => { refreshMetaConfig(true) }, []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    fetchMetaConfig().then((config) => {
-      if (config) {
-        setMetaConfig({ baseUrl: config.baseUrl, apiKey: '', model: config.model })
-        setSavedMeta({ baseUrl: config.baseUrl, model: config.model })
-        setMetaConfigured(config.configured)
-      } else {
-        setMetaConfigured(false)
-      }
-    })
-  }, [])
+    const iv = setInterval(() => refreshMetaConfig(false), 10000)
+    return () => clearInterval(iv)
+  }, [refreshMetaConfig])
 
   const liveSessions = useMemo(
     () => (sessions ?? []).filter((s) => sessionKind(s.status) === 'live'),
@@ -537,6 +660,7 @@ export default function App() {
                 >
                   ← Back to sessions
                 </button>
+                <GusControls session={selectedSession} metaConfigured={metaConfigured} onOpenSettings={() => setShowSettings(true)} onRefresh={loadDashboard} />
                 <SessionChat
                   sessionId={selectedSession.id}
                   projectDir={selectedSession.project_dir}
@@ -570,6 +694,8 @@ export default function App() {
                         sessions={liveSessions}
                         onRefresh={loadDashboard}
                         onSelect={(s) => setSelectedSession(s)}
+                        metaConfigured={metaConfigured}
+                        onOpenSettings={() => setShowSettings(true)}
                         note="Argus is actively managing these sessions. Status updates as OpenCode emits events."
                       />
                       <SessionSection
@@ -577,6 +703,8 @@ export default function App() {
                         sessions={disconnectedSessions}
                         onRefresh={loadDashboard}
                         onSelect={(s) => setSelectedSession(s)}
+                        metaConfigured={metaConfigured}
+                        onOpenSettings={() => setShowSettings(true)}
                         note="Argus lost contact with, or stopped tracking, these sessions. It cannot confirm the OpenCode process ended, so they may still be running."
                       />
                       <SessionSection
@@ -584,6 +712,8 @@ export default function App() {
                         sessions={pastSessions}
                         onRefresh={loadDashboard}
                         onSelect={(s) => setSelectedSession(s)}
+                        metaConfigured={metaConfigured}
+                        onOpenSettings={() => setShowSettings(true)}
                       />
                     </>
                   )
@@ -615,16 +745,9 @@ export default function App() {
                     Enable Argus assistant to diagnose incidents and propose recovery actions.
                     Requires a configured Meta-compatible API (OpenAI, local LLM, etc.).
                   </p>
-                  <div className="space-y-2">
-                    <label className="flex items-center gap-3 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        defaultChecked={true}
-                        className="w-4 h-4 rounded border-border bg-surface text-accent focus:ring-accent"
-                      />
-                      <span className="text-sm">Enable supervision for new sessions (can be toggled per session)</span>
-                    </label>
-                  </div>
+                  <p className="text-sm text-textMuted">
+                    Supervision is controlled per session with the Supervision toggle on each session card. New sessions start with supervision on, but it only takes effect once a model is configured below.
+                  </p>
                 </div>
 
                 {/* Model Configuration */}
@@ -679,12 +802,20 @@ export default function App() {
                         type="password"
                         value={metaConfig.apiKey}
                         onChange={(e) => setMetaConfig({ ...metaConfig, apiKey: e.target.value })}
-                        placeholder="sk-... or leave blank to use environment variable"
+                        placeholder={metaHasKey ? 'Saved key in place. Enter a new key to replace it' : 'sk-...'}
                         className="w-full bg-surface border border-border rounded px-3 py-2 text-text"
                       />
                       <p className="text-xs text-textMuted mt-1">
-                        Your API key. Not stored in the browser after saving. Falls back to META_API_KEY env var.
+                        {metaHasKey
+                          ? 'API key configured (saved on the service, never shown here). Leave blank to keep the saved key, or enter a new key to replace it.'
+                          : 'Your API key. Stored only on the Go service, never in the browser.'}
                       </p>
+                      {metaHasKey && !metaConfig.apiKey && metaConfigured && (
+                        <p className="text-xs text-green-400 mt-1">API key configured</p>
+                      )}
+                      {metaHasKey && !metaConfig.apiKey && metaConfigured === false && (
+                        <p className="text-xs text-amber-300 mt-1">An API key is saved on the service, but the assistant is not fully configured yet. Check the base URL and model, then Save.</p>
+                      )}
                     </div>
 
                     <div>
@@ -712,7 +843,7 @@ export default function App() {
                         const result = await testMetaConnection(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
                         setMetaTesting(false)
                         if (result.success) {
-                          setMetaTestSuccess('Test connection succeeded. This does not save the configuration.')
+                          setMetaTestSuccess(`Provider accepted the API key and model ${result.model ?? metaConfig.model} at ${result.baseUrl ?? metaConfig.baseUrl}. This does not save the configuration.`)
                         } else {
                           setMetaTestError(result.error || 'Connection failed')
                         }
@@ -727,19 +858,25 @@ export default function App() {
                         setMetaSaving(true)
                         setMetaSaveError(null)
                         setMetaSaveSuccess(null)
-                        const result = await saveMetaConfig(metaConfig.baseUrl, metaConfig.apiKey, metaConfig.model)
+                        const submitted = { ...metaConfig }
+                        const result = await saveMetaConfig(submitted.baseUrl, submitted.apiKey, submitted.model)
                         setMetaSaving(false)
                         if (result.success) {
-                          // Only claim success after the backend persisted and
-                          // reloaded the config; re-read it to confirm.
-                          const confirmed = await fetchMetaConfig()
-                          if (confirmed && confirmed.baseUrl && confirmed.model) {
-                            setMetaConfig({ baseUrl: confirmed.baseUrl, apiKey: '', model: confirmed.model })
-                            setSavedMeta({ baseUrl: confirmed.baseUrl, model: confirmed.model })
-                            setMetaConfigured(confirmed.configured)
-                            setMetaSaveSuccess(`Saved and verified after reload: ${confirmed.model} at ${confirmed.baseUrl}. It will persist across a service restart.`)
+                          // Backend persisted and reloaded the config. Update
+                          // only status/saved snapshot; keep the form fields
+                          // as submitted (no flicker), clearing just the key
+                          // input value, which is never kept in the browser.
+                          const baseUrl = result.baseUrl ?? submitted.baseUrl
+                          const model = result.model ?? submitted.model
+                          setSavedMeta({ baseUrl, model })
+                          setMetaHasKey(result.hasKey ?? metaHasKey)
+                          setMetaConfigured(result.configured ?? false)
+                          setMetaConfig((prev) => ({ ...prev, apiKey: '' }))
+                          void refreshMetaConfig(false)
+                          if (result.configured) {
+                            setMetaSaveSuccess(`Saved and verified after reload: ${model} at ${baseUrl}. It will persist across a service restart.`)
                           } else {
-                            setMetaSaveError('Save reported success but the reloaded configuration could not be verified. Check the Go service log.')
+                            setMetaSaveSuccess(`Saved base URL and model (${model} at ${baseUrl}), but no API key is configured yet, so the assistant is not fully configured.`)
                           }
                         } else {
                           setMetaSaveError(result.error || 'Save failed')
