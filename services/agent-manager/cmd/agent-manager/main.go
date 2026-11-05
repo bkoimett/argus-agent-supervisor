@@ -150,6 +150,7 @@ func main() {
 	// Initialize dashboard server
 	startTime := time.Now()
 	dash := dashboard.NewServer(mgr, st, *port, opencodeAdapter, sbClient, startTime)
+	dash.MetaEnvPath = dashboard.ResolveMetaEnvPath()
 
 	// Start command processing loop (phone → agent messaging via Supabase commands table).
 	// The laptop initiates the outbound connection to Supabase; nothing is exposed publicly.

@@ -1,0 +1,118 @@
+/* Argus Design Tokens - PWA
+   Must be kept in sync with apps/desktop/src/tokens.css
+   See DESIGN.md for the token sync rule. */
+
+:root {
+  /* Base colors (dark mode defaults) */
+  --bg: #18181b;
+  --surface: #1f1f23;
+  --surface-hover: #27272a;
+  --surface-raised: #2d2d31;
+  --overlay: rgba(24, 24, 27, 0.9);
+
+  /* Borders */
+  --border-subtle: #2f2f33;
+  --border: #3f3f46;
+  --border-strong: #52525b;
+
+  /* Text */
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #71717a;
+  --text-disabled: #52525b;
+
+  /* Accent */
+  --accent: #0ea5e9;
+  --accent-hover: #0284c7;
+  --accent-muted: rgba(14, 165, 233, 0.15);
+
+  /* Semantic status colors */
+  --status-working: #22c55e;
+  --status-waiting: #f59e0b;
+  --status-error: #ef4444;
+  --status-disconnected: #71717a;
+  --status-recovering: #a855f7;
+  --status-pending: #0ea5e9;
+
+  /* Focus ring */
+  --focus-ring: var(--accent);
+
+  /* Typography */
+  --font-sans: 'Geist', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'Geist Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --text-xs: 0.7rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.125rem;
+
+  /* Spacing scale (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 24px -4px rgba(0, 0, 0, 0.5);
+
+  /* Transitions */
+  --transition-fast: 120ms ease-out;
+  --transition-normal: 160ms ease-out;
+}
+
+/* Light mode via data-theme attribute */
+[data-theme="light"] {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-hover: #f4f4f5;
+  --surface-raised: #ffffff;
+  --overlay: rgba(250, 250, 250, 0.95);
+
+  --border-subtle: #e4e4e7;
+  --border: #d4d4d8;
+  --border-strong: #a1a1aa;
+
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-tertiary: #71717a;
+  --text-disabled: #a1a1aa;
+
+  --accent: #0284c7;
+  --accent-hover: #0369a1;
+  --accent-muted: rgba(2, 132, 199, 0.12);
+
+  --status-working: #16a34a;
+  --status-waiting: #d97706;
+  --status-error: #dc2626;
+  --status-disconnected: #71717a;
+  --status-recovering: #9333ea;
+  --status-pending: #0284c7;
+
+  --focus-ring: var(--accent);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 12px 24px -4px rgba(0, 0, 0, 0.1);
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition-fast: 0ms;
+    --transition-normal: 0ms;
+  }
+}

@@ -99,102 +99,6 @@ export async function sendCommandToSession(sessionId: string, type: string, payl
   return !error
 }
 
-function PairingScreen({ onPaired }: { onPaired: () => void }) {
-  const [code, setCode] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-
-  const handlePair = async () => {
-    if (!code.trim() || code.length !== 6) {
-      setError('Enter a valid 6-character pairing code')
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-
-    try {
-      const sb = getSupabase()
-      if (!sb) throw new Error('Supabase not configured')
-
-      // Validate pairing code
-      const { data, error: validateError } = await sb
-        .from('pairing_codes')
-        .select('user_id')
-        .eq('code', code.toUpperCase())
-        .gt('expires_at', new Date().toISOString())
-        .single()
-
-      if (validateError || !data) throw new Error('Invalid or expired pairing code')
-
-      const userId = (data as any).user_id as string
-
-      // Generate a device ID
-      const deviceId = 'mobile-' + Math.random().toString(36).substr(2, 9)
-
-      // Store device ID locally
-      localStorage.setItem('argus_device_id', deviceId)
-      localStorage.setItem('argus_user_id', userId)
-      localStorage.setItem('argus_paired', 'true')
-
-      // Delete the used code
-      await sb.from('pairing_codes').delete().eq('code', code.toUpperCase())
-
-      onPaired()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Pairing failed')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="bg-surface border border-border rounded-xl p-8 w-full max-w-md">
-        <div className="text-center mb-8">
-          <h1 className="text-2xl font-medium">Argus Remote</h1>
-          <p className="text-textMuted mt-1">Pair with your desktop</p>
-        </div>
-
-        {error && (
-          <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded text-red-400 text-sm">
-            {error}
-          </div>
-        )}
-
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-2">Pairing Code</label>
-            <input
-              type="text"
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              placeholder="ABC123"
-              maxLength={6}
-              className="w-full text-center text-2xl tracking-widest font-mono"
-              autoFocus
-              disabled={loading}
-            />
-            <p className="text-xs text-textMuted mt-1 text-center">Enter the 6-character code from your desktop app</p>
-          </div>
-
-          <button
-            onClick={handlePair}
-            disabled={loading || code.length !== 6}
-            className="w-full py-3 bg-accent hover:bg-accentHover text-white rounded-lg font-medium disabled:opacity-50"
-          >
-            {loading ? 'Pairing...' : 'Pair Device'}
-          </button>
-        </div>
-
-        <div className="mt-8 text-center text-sm text-textMuted">
-          <p>Don't have a code? Open the Argus desktop app to generate one.</p>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // Permission approve/deny is contract-only plumbing and has NOT been verified
 // end-to-end against a live OpenCode permission request. The UI controls are
 // therefore rendered disabled with an explanation until a real request can be
@@ -285,7 +189,6 @@ function SettingsScreen({ onClose }: { onClose: () => void }) {
   const [supabaseUrl, setSupabaseUrl] = useState(() => localStorage.getItem('argus_supabase_url') || '')
   const [supabaseKey, setSupabaseKey] = useState(() => localStorage.getItem('argus_supabase_key') || '')
   const [deviceName, setDeviceName] = useState(() => localStorage.getItem('argus_device_name') || '')
-  const paired = localStorage.getItem('argus_paired') === 'true'
   const [notifPrefs, setNotifPrefs] = useState<Record<string, boolean>>(() => {
     const stored = localStorage.getItem('argus_notif_prefs')
     if (stored) {
@@ -397,19 +300,7 @@ function SettingsScreen({ onClose }: { onClose: () => void }) {
             </button>
           </div>
 
-          {paired && (
-            <button
-              onClick={() => {
-                localStorage.removeItem('argus_paired')
-                localStorage.removeItem('argus_device_id')
-                localStorage.removeItem('argus_user_id')
-                window.location.reload()
-              }}
-              className="w-full py-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 rounded font-medium"
-            >
-              Unpair Device
-            </button>
-          )}
+          
         </div>
       </div>
     </div>
@@ -563,12 +454,12 @@ function SessionDetailScreen({
 }
 
 export default function App() {
-  const [view, setView] = useState<'pairing' | 'sessions' | 'session-detail' | 'settings'>('sessions')
+  const [view, setView] = useState<'sessions' | 'session-detail' | 'settings'>('sessions')
   const [sessions, setSessions] = useState<Session[]>([])
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [paired, setPaired] = useState(() => localStorage.getItem('argus_paired') === 'true')
+  const paired = true
   const [selectedSession, setSelectedSession] = useState<Session | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
 
@@ -644,20 +535,9 @@ export default function App() {
         sb.removeChannel(channelRef.current)
       }
     }
-  }, [paired, loadData])
+  }, [loadData])
 
-  // Check pairing status on mount
-  useEffect(() => {
-    const isPaired = localStorage.getItem('argus_paired') === 'true'
-    setPaired(isPaired)
-    if (!isPaired) {
-      setView('pairing')
-    }
-  }, [])
-
-  if (!paired) {
-    return <PairingScreen onPaired={() => { setPaired(true); setView('sessions'); loadData(); }} />
-  }
+  
 
   return (
     <div className="min-h-screen bg-background">
